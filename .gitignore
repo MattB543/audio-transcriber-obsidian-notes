@@ -1,0 +1,27 @@
+# --- secrets ----------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# --- runtime / generated ----------------------------------------------------
+.logs/
+.published.json
+drafts/
+
+# --- scratch / dev test files (manual sanity checks, not in the pytest suite) -
+_test_*.py
+_codex_review_prompt.txt
+
+# example-audio/ is intentionally committed — it ships a short sample clip so
+# you can run an end-to-end test immediately after cloning.
