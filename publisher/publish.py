@@ -22,6 +22,7 @@ Key entry point: ``publish_note(transcript_md_path) -> PublishResult``.
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import re
 import shutil
@@ -148,6 +149,24 @@ def _compute_content_hash(title: str, transcript_text: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _compute_clipping_content_hash(
+    title: str, comment: str, body: str
+) -> str:
+    """SHA256 of (title + comment + body) for a web clipping.
+
+    Kept SEPARATE from `_compute_content_hash` (which hashes title + transcript)
+    because clippings have a different content shape: editing EITHER the user's
+    commentary OR the mirrored clipping body should trigger a republish. The
+    watcher routes to this hash for sources under ``config.CLIPPINGS_DIR``.
+    """
+    payload = (
+        f"{(title or '').strip()}\n"
+        f"---comment---\n{(comment or '').strip()}\n"
+        f"---body---\n{(body or '').strip()}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _yaml_dump_str(value: str) -> str:
     """Format a single string as a safe YAML scalar (always double-quoted)."""
     escaped = (
@@ -184,6 +203,308 @@ def _build_published_md(
         "",
     ]
     return "\n".join(fm_lines)
+
+
+# ---------------------------------------------------------------------------
+# Clipping -> /consuming page builder (no LLM)
+# ---------------------------------------------------------------------------
+
+# How many characters of the comment to use as the index/meta description when
+# we excerpt the user's commentary. Same word-boundary truncation as
+# `_build_description` so the two read consistently.
+_COMMENT_EXCERPT_MAX_CHARS = 200
+
+# Obsidian wikilink wrapper: `[[Lizka]]` or `[[Owen Cotton-Barratt]]`. Clipping
+# `author` fields use this syntax; we strip the brackets for display.
+_WIKILINK_RE = re.compile(r"\[\[(?P<inner>.+?)\]\]")
+
+
+def _strip_wikilink(value: str) -> str:
+    """Turn `[[Owen Cotton-Barratt]]` into `Owen Cotton-Barratt`.
+
+    Also handles the `[[target|alias]]` form by keeping the alias (display
+    text). Leaves plain strings untouched.
+    """
+    def _repl(m: re.Match[str]) -> str:
+        inner = m.group("inner")
+        # `[[target|alias]]` -> show the alias.
+        if "|" in inner:
+            inner = inner.split("|", 1)[1]
+        return inner.strip()
+
+    return _WIKILINK_RE.sub(_repl, value).strip()
+
+
+def _normalize_authors(raw_author: object) -> str:
+    """Normalize the clipping `author` frontmatter into a display string.
+
+    Accepts a list (the common Obsidian-clipper shape) or a single string,
+    strips `[[wikilink]]` brackets from each entry, drops blanks, and joins
+    with ", ". Returns "" when there are no authors.
+    """
+    if raw_author is None:
+        return ""
+    items: list[str]
+    if isinstance(raw_author, list):
+        items = [str(a) for a in raw_author]
+    else:
+        items = [str(raw_author)]
+    cleaned = [_strip_wikilink(a).strip() for a in items]
+    cleaned = [a for a in cleaned if a]
+    return ", ".join(cleaned)
+
+
+def _pretty_source(url: str) -> str:
+    """Produce friendly link text for a source URL.
+
+    Prefers the bare host (e.g. "forum.effectivealtruism.org"); appends the
+    path when it's short and meaningful. Falls back to the full URL if it can't
+    be parsed. Never raises.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+    except (ValueError, ImportError):  # pragma: no cover — defensive
+        return url
+    host = parts.netloc
+    if not host:
+        # Not a recognizable absolute URL; show it verbatim.
+        return url
+    path = (parts.path or "").rstrip("/")
+    # Keep a short path for context, but don't dump a giant slug into the link
+    # text. Anything past ~40 chars of path we drop down to just the host.
+    if path and path != "" and len(path) <= 40:
+        return f"{host}{path}"
+    return host
+
+
+def _comment_excerpt(comment: str) -> str:
+    """First N chars of the comment as a one-line meta/index description.
+
+    Collapses whitespace and truncates at a word boundary + "..." just like
+    `_build_description`, so the /consuming index reads as a single tidy line.
+    """
+    text = re.sub(r"\s+", " ", (comment or "").strip())
+    if not text:
+        return ""
+    if len(text) <= _COMMENT_EXCERPT_MAX_CHARS:
+        return text
+    cut = text[:_COMMENT_EXCERPT_MAX_CHARS].rstrip()
+    space = cut.rfind(" ")
+    if space > _COMMENT_EXCERPT_MAX_CHARS // 2:
+        cut = cut[:space].rstrip()
+    return cut + "..."
+
+
+# Sentence-ending punctuation we treat as a clean truncation boundary. We look
+# for one of these followed by whitespace so "e.g." style abbreviations near the
+# limit are less likely to be chosen as the cut point.
+_SENTENCE_END_RE = re.compile(r"[.!?][\"'’”)\]]?\s")
+
+
+def _truncate_preview(body: str, limit: int) -> str:
+    """Truncate ``body`` to about ``limit`` chars at a CLEAN boundary.
+
+    Preference order, all measured within the first ``limit`` characters:
+      1. the last paragraph break (``\\n\\n``) before the limit,
+      2. else the last sentence end (``.``/``!``/``?`` + whitespace),
+      3. else the last whitespace run,
+      4. else (a single giant word) a hard cut at ``limit``.
+
+    Never cuts mid-word for cases 1-3. The returned text is right-stripped so the
+    fade block that follows starts cleanly. Callers only invoke this when
+    ``len(body) > limit`` (a shorter body is shown verbatim), but it is safe to
+    call on any input.
+    """
+    if limit <= 0:
+        return ""
+    if len(body) <= limit:
+        return body.rstrip()
+
+    window = body[:limit]
+
+    # 1. last paragraph break before the limit.
+    para = window.rfind("\n\n")
+    if para > 0:
+        return window[:para].rstrip()
+
+    # 2. last sentence end before the limit. Search the window plus one trailing
+    #    char so a sentence ending exactly at the boundary (punct then the next
+    #    char being whitespace) still counts.
+    probe = body[: limit + 1]
+    last_sentence = -1
+    for m in _SENTENCE_END_RE.finditer(probe):
+        # The boundary is just after the punctuation; keep the punctuation.
+        end = m.start() + 1
+        if end <= limit:
+            last_sentence = end
+    if last_sentence > limit // 2:
+        return body[:last_sentence].rstrip()
+
+    # 3. last whitespace run -> don't cut mid-word.
+    space = window.rstrip().rfind(" ")
+    nl = window.rstrip().rfind("\n")
+    boundary = max(space, nl)
+    if boundary > 0:
+        return window[:boundary].rstrip()
+
+    # 4. a single oversized word with no boundary: hard cut.
+    return window.rstrip()
+
+
+def _build_consuming_md(
+    *,
+    title: str,
+    description: str,
+    comment: str,
+    source_url: str,
+    authors: str,
+    created_iso: str,
+    clipping_body: str,
+) -> str:
+    """Build the deterministic /consuming page markdown for a web clipping.
+
+    SECTIONED template (approved):
+
+      - frontmatter (title, layout, backLink/backText, source: clipping,
+        created, description)
+      - "## My commentary" + the comment, then a `---` divider (OMITTED
+        entirely when there is no comment)
+      - a "**Source:**" line + "By <authors> · clipped <date>" byline + a
+        disclaimer blockquote, then a `---` divider
+      - the mirrored clipping body as a TRUNCATED PREVIEW (see below)
+
+    Body preview behaviour (``config.CLIPPING_PREVIEW_CHARS``):
+      - If the body is longer than the preview limit, only the opening is shown
+        (truncated at a clean paragraph/sentence/word boundary, rendered as
+        normal markdown), followed by a fade-out + "Read the full version at the
+        source →" call-to-action linking back to the original URL.
+      - If the body is at or under the limit, the FULL body is shown with no
+        fade block / CTA (it's already complete).
+      - If truncated but there's no source URL, the fade block stays but the CTA
+        becomes a plain "Full text not mirrored" note (no link).
+
+    The fade block is a self-contained raw ``<div>`` with inline styles only.
+    Per CommonMark, markdown inside a block-level ``<div>`` is NOT re-parsed, so
+    we keep all markdown OUTSIDE the wrapper and only put a plain HTML link
+    inside it.
+
+    Rules for the optional bits:
+      - No comment -> omit the commentary heading/block AND its trailing divider
+        (the page then starts with "**Source:**").
+      - No source URL -> render "**Source:** _(original URL not recorded)_" and
+        word the disclaimer so it does not say "above".
+      - No authors -> omit the "By <authors>" part of the byline.
+      - No created date -> omit "· clipped <date>".
+    """
+    lines: list[str] = [
+        "---",
+        f"title: {_yaml_dump_str(title)}",
+        "layout: ../../layouts/Layout.astro",
+        "backLink: ./",
+        "backText: Consuming",
+        "source: clipping",
+        f"created: {created_iso}",
+        f"description: {_yaml_dump_str(description)}",
+        "---",
+        "",
+    ]
+
+    comment_text = (comment or "").strip()
+    if comment_text:
+        lines.append("## My commentary")
+        lines.append("")
+        lines.append(comment_text)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    # Source line.
+    source_url = (source_url or "").strip()
+    if source_url:
+        pretty = _pretty_source(source_url)
+        lines.append(f"**Source:** [{pretty}]({source_url})")
+    else:
+        lines.append("**Source:** _(original URL not recorded)_")
+
+    # Byline: "By <authors> · clipped <date>". Each half is optional.
+    byline_bits: list[str] = []
+    authors = (authors or "").strip()
+    if authors:
+        byline_bits.append(f"By {authors}")
+    created = (created_iso or "").strip()
+    if created:
+        byline_bits.append(f"clipped {created}")
+    if byline_bits:
+        lines.append(" · ".join(byline_bits))
+
+    lines.append("")
+    # Disclaimer blockquote. We now publish a short PREVIEW of the body, so the
+    # wording points the reader at the source for the full thing. When there's
+    # no source URL we can't point "above", so we soften it.
+    body_text = (clipping_body or "").strip()
+    preview_limit = config.CLIPPING_PREVIEW_CHARS
+    truncated = len(body_text) > preview_limit
+    if source_url:
+        lines.append(
+            "> Mirrored as a short preview from a web clipping saved in my "
+            "Obsidian —"
+        )
+        lines.append(
+            "> only the opening is shown here. Read the full thing at the "
+            "source above"
+        )
+        lines.append("> (if it's still up).")
+    else:
+        lines.append(
+            "> Mirrored as a short preview from a web clipping saved in my "
+            "Obsidian —"
+        )
+        lines.append(
+            "> only the opening is shown here. The original source URL was not "
+            "recorded,"
+        )
+        lines.append("> so the full version may live elsewhere.")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    if not truncated:
+        # Short body: show it in full, no fade / CTA (it's already complete).
+        lines.append(body_text)
+        lines.append("")
+        return "\n".join(lines)
+
+    # Long body: show a truncated opening rendered as normal markdown, then a
+    # self-contained fade-out + CTA block. Keep markdown OUTSIDE the wrapper div
+    # (CommonMark won't re-parse markdown inside a block-level <div>); only a
+    # plain HTML link goes inside it.
+    preview = _truncate_preview(body_text, preview_limit)
+    lines.append(preview)
+    lines.append("")
+    lines.append(
+        '<div style="position:relative; margin-top:-5rem; padding-top:5rem; '
+        "background:linear-gradient(to bottom, transparent, var(--color-bg) "
+        '70%); text-align:center;">'
+    )
+    if source_url:
+        href = html.escape(source_url, quote=True)
+        lines.append(
+            f'  <p style="margin:0;"><a href="{href}">Read the full version at '
+            "the source →</a></p>"
+        )
+    else:
+        lines.append(
+            '  <p style="margin:0;"><em>Full text not mirrored — original '
+            "source not recorded.</em></p>"
+        )
+    lines.append("</div>")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _read_source_frontmatter_field(source_path: Path, field: str) -> str | None:
@@ -355,6 +676,33 @@ def _resolve_slug_collision(slug: str, *dirs: Path) -> str:
     return candidate
 
 
+# Anything that is NOT an ASCII alphanumeric becomes a slug separator. We keep
+# the original case (the /consuming convention is Title-Case-hyphen, e.g.
+# "Jim-Rutt-on-Win-Win") and collapse runs of spaces, punctuation, and
+# em/en-dashes into a single hyphen.
+_CONSUMING_SLUG_SEP_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def _consuming_slugify(title: str) -> str:
+    """Produce a Title-Case-hyphen slug matching the existing /consuming convention.
+
+    Preserves the original case (unlike `_slugify`, which lowercases for the
+    notes section). Drops apostrophes entirely so "Matt's" -> "Matts" rather
+    than "Matt-s", then replaces every run of non-alphanumeric characters
+    (spaces, punctuation, em-dashes) with a single hyphen and strips leading /
+    trailing hyphens.
+
+    e.g. "AI Tools for Existential Security — EA Forum"
+          -> "AI-Tools-for-Existential-Security-EA-Forum"
+    """
+    s = (title or "").strip()
+    # Drop apostrophes so possessives collapse cleanly (Matt's -> Matts).
+    s = s.replace("'", "").replace("’", "")
+    s = _CONSUMING_SLUG_SEP_RE.sub("-", s)
+    s = _SLUG_COLLAPSE_RE.sub("-", s).strip("-")
+    return s or "clipping"
+
+
 # ---------------------------------------------------------------------------
 # Git helpers
 # ---------------------------------------------------------------------------
@@ -437,6 +785,202 @@ def _working_tree_clean(cwd: Path) -> bool:
 def _current_head(cwd: Path) -> str:
     proc = _git(["rev-parse", "HEAD"], cwd=cwd)
     return proc.stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# Consuming index auto-update
+# ---------------------------------------------------------------------------
+
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+# Heading matchers. `## 2025` is a year section; `### October` is a month
+# section. We deliberately match on the heading level so a stray `## My
+# commentary`-style heading inside a paragraph never trips us.
+_YEAR_HEADING_RE = re.compile(r"^##\s+(?P<year>\d{4})\s*$")
+_MONTH_HEADING_RE = re.compile(r"^###\s+(?P<month>[A-Za-z]+)\s*$")
+
+
+def _parse_iso_date(value: str) -> date | None:
+    """Parse a ``YYYY-MM-DD`` (optionally with a time suffix) into a date.
+
+    Returns None if the leading 10 chars aren't a valid ISO date. Used for the
+    clipping's ``created`` field, which Obsidian writes as a bare date but the
+    user might hand-edit.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _consuming_index_bullet(title: str, slug: str, description: str) -> str:
+    """Build the single index bullet line for a clipping."""
+    desc = re.sub(r"\s+", " ", (description or "").strip())
+    return f"- **[{title}](/consuming/{slug})** - {desc}"
+
+
+def _update_consuming_index(
+    index_path: Path,
+    *,
+    title: str,
+    slug: str,
+    description: str,
+    entry_date: date,
+) -> bool:
+    """Insert (or update in place) a clipping bullet in the /consuming index.
+
+    The index is grouped ``## <YYYY>`` -> ``### <MonthName>`` with bullets like
+    ``- **[Title](/consuming/Slug)** - description``. We:
+
+      1. Remove any existing bullet line that links to ``/consuming/<slug>`` so
+         a republish updates in place (idempotent — no duplicate bullets).
+      2. Ensure a ``## <year>`` section exists (years descending) and a
+         ``### <month>`` subsection within it (months descending), creating
+         either heading if missing.
+      3. Insert the fresh bullet at the TOP of that month's bullet list
+         (reverse-chronological within the month).
+
+    The intro paragraph(s) above the first year heading and the trailing
+    ``<!-- Structure... -->`` comment are preserved by operating on the line
+    list, never a brittle whole-file regex.
+
+    Returns True if the file was written (always, on success). Raises OSError on
+    read/write failure (the caller treats that as a publish error).
+    """
+    year = entry_date.year
+    month_name = _MONTH_NAMES[entry_date.month - 1]
+    bullet = _consuming_index_bullet(title, slug, description)
+    link_marker = f"](/consuming/{slug})"
+
+    original = index_path.read_text(encoding="utf-8")
+    # Preserve trailing-newline style: splitlines() drops it; we re-add below.
+    lines = original.splitlines()
+
+    # --- 1. drop any existing bullet for this slug (idempotency). ---
+    lines = [ln for ln in lines if link_marker not in ln]
+
+    # --- locate the trailing HTML comment block so we never insert past it. ---
+    # Everything from the first `<!--` after the last content line is treated as
+    # the trailing structure comment and kept at the bottom.
+    trailing_start = len(lines)
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("<!--"):
+            trailing_start = i
+            break
+    head = lines[:trailing_start]
+    trailing = lines[trailing_start:]
+
+    # --- 2/3. find or create the year + month section within `head`. ---
+    # Collect indices of all year headings.
+    year_positions: list[tuple[int, int]] = []  # (line_index, year_value)
+    for i, ln in enumerate(head):
+        m = _YEAR_HEADING_RE.match(ln)
+        if m:
+            year_positions.append((i, int(m.group("year"))))
+
+    def _section_bounds(start_idx: int, heading_re: re.Pattern[str]) -> int:
+        """Return the end index (exclusive) of the section starting at
+        ``start_idx`` (whose heading is at start_idx). The section ends at the
+        next heading of the SAME level, or end of ``head``."""
+        for j in range(start_idx + 1, len(head)):
+            if heading_re.match(head[j]):
+                return j
+        return len(head)
+
+    target_year_idx: int | None = None
+    for idx, yr in year_positions:
+        if yr == year:
+            target_year_idx = idx
+            break
+
+    if target_year_idx is None:
+        # Create a new `## <year>` section. Insert so years stay DESCENDING.
+        # Find the first existing year that is smaller than ours; insert before
+        # its heading. If none smaller (or no years at all), append after the
+        # intro (i.e. at the end of `head`).
+        insert_at = len(head)
+        for idx, yr in year_positions:
+            if yr < year:
+                insert_at = idx
+                break
+        new_block = [f"## {year}", "", f"### {month_name}", "", bullet, ""]
+        # Ensure a blank line separates the new block from preceding content.
+        if insert_at > 0 and head[insert_at - 1].strip() != "":
+            new_block = [""] + new_block
+        head[insert_at:insert_at] = new_block
+        _write_index(index_path, head, trailing, original)
+        return True
+
+    # Year section exists. Find its bounds, then locate the month within it.
+    year_end = _section_bounds(target_year_idx, _YEAR_HEADING_RE)
+    month_positions: list[tuple[int, str]] = []  # (line_index, month_name)
+    for j in range(target_year_idx + 1, year_end):
+        m = _MONTH_HEADING_RE.match(head[j])
+        if m:
+            month_positions.append((j, m.group("month")))
+
+    target_month_idx: int | None = None
+    for idx, mn in month_positions:
+        if mn.lower() == month_name.lower():
+            target_month_idx = idx
+            break
+
+    target_month_num = entry_date.month
+
+    def _month_num(name: str) -> int:
+        try:
+            return _MONTH_NAMES.index(name.capitalize()) + 1
+        except ValueError:
+            return 0
+
+    if target_month_idx is None:
+        # Create a new `### <month>` subsection within this year. Months
+        # DESCENDING: insert before the FIRST existing month smaller than ours.
+        # If ours is the newest, the first existing month is already smaller, so
+        # we land right after the `## <year>` heading (top of year). If ours is
+        # the oldest, no existing month is smaller, so the default `year_end`
+        # appends it after the last month in this year's section.
+        insert_at = year_end
+        for idx, mn in month_positions:
+            if _month_num(mn) < target_month_num:
+                insert_at = idx
+                break
+        new_block = [f"### {month_name}", "", bullet, ""]
+        if insert_at > 0 and head[insert_at - 1].strip() != "":
+            new_block = [""] + new_block
+        head[insert_at:insert_at] = new_block
+        _write_index(index_path, head, trailing, original)
+        return True
+
+    # Month subsection exists: insert the bullet at the TOP of its list (just
+    # after the `### <month>` heading and any blank line).
+    insert_at = target_month_idx + 1
+    while insert_at < year_end and head[insert_at].strip() == "":
+        insert_at += 1
+    head[insert_at:insert_at] = [bullet]
+    _write_index(index_path, head, trailing, original)
+    return True
+
+
+def _write_index(
+    index_path: Path,
+    head: list[str],
+    trailing: list[str],
+    original: str,
+) -> None:
+    """Join head + trailing back into a document and write it, preserving the
+    original file's trailing-newline style."""
+    new_lines = head + trailing
+    new_doc = "\n".join(new_lines)
+    if original.endswith("\n"):
+        new_doc += "\n"
+    index_path.write_text(new_doc, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -925,6 +1469,458 @@ def publish_note(
     logger.info(
         "[publish] DONE %s -> %s (commit=%s, hash=%s, source_updated=%s)",
         transcript_md_path.name, slug,
+        commit_sha[:8] if commit_sha else "?", content_hash[:12], wrote_back,
+    )
+    return _result(
+        status="published",
+        slug=slug,
+        commit_sha=commit_sha,
+        site_path=site_path,
+        content_hash=content_hash,
+        published_at=result_published_at,
+    )
+
+
+def publish_clipping(
+    clipping_md_path: Path,
+    *,
+    existing_slug: str | None = None,
+) -> PublishResult:
+    """Publish an Obsidian web clipping to the personal site's /consuming section.
+
+    Deterministic -- NO LLM call. Mirrors :func:`publish_note` step-for-step
+    (opt-in guard, dirty-tree check, pull --ff-only, slug-collision, write,
+    commit, push, ledger writeback, recovery) but:
+
+      - writes a ``/consuming/<Slug>`` page (Title-Case-hyphen slug) built from
+        the clipping's frontmatter + body via :func:`_build_consuming_md`,
+      - ALSO updates the consuming ``index.md`` and stages BOTH the new page and
+        the index in the SAME commit, pushed once,
+      - hashes (title + comment + body) so editing the comment OR the body
+        triggers a republish (kept separate from the transcript hash).
+
+    Parameters mirror :func:`publish_note`. ``existing_slug`` reuses the slug a
+    prior publish used (republish-in-place, no ``<slug>-2`` churn).
+
+    Returns a :class:`PublishResult`. Never raises.
+    """
+    clipping_md_path = Path(clipping_md_path)
+    logger.info("[clipping] START %s (existing_slug=%s)",
+                clipping_md_path, existing_slug)
+
+    # Opt-in guard: clippings publish to /consuming, which needs both SITE_ROOT
+    # and SITE_CONSUMING_DIR. Fail fast with an actionable message rather than
+    # crash on a None path mid-flow (mirrors publish_note).
+    if config.SITE_ROOT is None or config.SITE_CONSUMING_DIR is None:
+        msg = (
+            "Publishing is disabled: NOTES_SITE_ROOT is not set, so there is "
+            "no site repo to publish clippings to. Set NOTES_SITE_ROOT in your "
+            ".env to enable the #publish feature."
+        )
+        logger.error(msg)
+        return _result(status="error", error=msg)
+
+    try:
+        md = clipping_md_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        return _result(status="error", error=f"Clipping file not found: {exc}")
+    except OSError as exc:
+        return _result(status="error", error=f"Failed to read clipping: {exc}")
+
+    # --- 1. parse Obsidian frontmatter + body ---
+    fm, clipping_body = _split_frontmatter(md)
+    raw_title = fm.get("title")
+    if raw_title is None:
+        source_title = ""
+    else:
+        source_title = str(raw_title).strip()
+    if not source_title:
+        msg = (
+            f"Clipping {clipping_md_path.name} has no `title:` in frontmatter "
+            "(or it's blank); refusing to publish without a title."
+        )
+        logger.error(msg)
+        return _result(status="error", error=msg)
+
+    # --- 2. read the clipping-specific fields ---
+    source_url = ""
+    raw_source = fm.get("source")
+    if raw_source is not None:
+        source_url = str(raw_source).strip()
+    authors = _normalize_authors(fm.get("author"))
+    comment_raw = fm.get(config.CLIPPING_COMMENT_FIELD)
+    comment = "" if comment_raw is None else str(comment_raw).strip()
+
+    # `created` may be a date object (PyYAML parses bare dates), a string, or
+    # missing. Fall back to today's date so the page + index always have one.
+    raw_created = fm.get("created")
+    if raw_created is None or str(raw_created).strip() == "":
+        created_iso = date.today().isoformat()
+        entry_date = date.today()
+    else:
+        created_iso = str(raw_created).strip()
+        entry_date = _parse_iso_date(created_iso) or date.today()
+
+    clipping_description = ""
+    raw_desc = fm.get("description")
+    if raw_desc is not None:
+        clipping_description = str(raw_desc).strip()
+
+    # --- 3. build deterministic /consuming page ---
+    # Index/meta description: prefer a one-line excerpt of the comment, else the
+    # clip description, else the title.
+    if comment:
+        description = _comment_excerpt(comment)
+    elif clipping_description:
+        description = re.sub(r"\s+", " ", clipping_description)
+    else:
+        description = source_title
+
+    consuming_md = _build_consuming_md(
+        title=source_title,
+        description=description,
+        comment=comment,
+        source_url=source_url,
+        authors=authors,
+        created_iso=created_iso,
+        clipping_body=clipping_body,
+    )
+    content_hash = _compute_clipping_content_hash(
+        source_title, comment, clipping_body
+    )
+    logger.info(
+        "[clipping] built page title=%r has_comment=%s body_len=%d hash=%s",
+        source_title, bool(comment), len(clipping_body), content_hash[:12],
+    )
+
+    # --- 4. git status check (must happen before pull) ---
+    site_root = config.SITE_ROOT
+    consuming_dir = config.SITE_CONSUMING_DIR
+    try:
+        if not _working_tree_clean(site_root):
+            msg = (
+                f"personal_site working tree is dirty at {site_root}; "
+                "commit or stash before publishing."
+            )
+            logger.error(msg)
+            return _result(status="error", error=msg)
+    except subprocess.CalledProcessError as exc:
+        return _result(
+            status="error",
+            error=f"git status failed: {exc.stderr.strip() or exc}",
+        )
+    except FileNotFoundError as exc:
+        return _result(status="error", error=f"git not found: {exc}")
+
+    # --- 5. pull --ff-only FIRST, before slug resolution ---
+    try:
+        _git(["pull", "--ff-only", "origin", "main"], cwd=site_root)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        msg = f"git pull --ff-only failed: {stderr or exc}"
+        logger.error(msg)
+        return _result(status="error", error=msg)
+
+    head_before_commit = _current_head(site_root)
+
+    # --- 6. slug + collision resolution (against post-pull state) ---
+    slug_base = _consuming_slugify(source_title)
+    if existing_slug:
+        slug = existing_slug
+        if slug != slug_base:
+            logger.info(
+                "[clipping] reusing existing slug %r (title-derived would be %r)",
+                slug, slug_base,
+            )
+    else:
+        slug = _resolve_slug_collision(slug_base, consuming_dir, config.DRAFTS_DIR)
+
+    # --- 7. write staging draft ---
+    draft_path = config.DRAFTS_DIR / f"{slug}.md"
+    try:
+        config.DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+        draft_path.write_text(consuming_md, encoding="utf-8")
+    except OSError as exc:
+        return _result(status="error", slug=slug, error=f"Failed to write draft: {exc}")
+
+    # --- 8. copy draft into the site /consuming dir ---
+    site_path = consuming_dir / f"{slug}.md"
+    try:
+        consuming_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(draft_path, site_path)
+    except OSError as exc:
+        return _result(
+            status="error", slug=slug, error=f"Failed to copy to site: {exc}"
+        )
+
+    # --- 9. update the consuming index.md (idempotent; in place on republish) ---
+    index_path = consuming_dir / "index.md"
+    index_existed = index_path.exists()
+    if index_existed:
+        try:
+            _update_consuming_index(
+                index_path,
+                title=source_title,
+                slug=slug,
+                description=description,
+                entry_date=entry_date,
+            )
+        except OSError as exc:
+            # Recover: remove the page we copied so the tree doesn't go dirty
+            # forever, then report the error.
+            try:
+                site_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return _result(
+                status="error",
+                slug=slug,
+                site_path=site_path,
+                error=f"Failed to update consuming index: {exc}",
+            )
+    else:
+        # No index to update -- publish the page anyway, just log it. We do not
+        # fabricate an index from scratch (its intro/structure is user-owned).
+        logger.warning(
+            "[clipping] consuming index %s does not exist; publishing the page "
+            "without an index entry.", index_path,
+        )
+
+    # --- 10. git add (page + index) ---
+    rel_site_path = site_path.relative_to(site_root).as_posix()
+    rel_paths = [rel_site_path]
+    if index_existed:
+        rel_paths.append(index_path.relative_to(site_root).as_posix())
+    commit_message = f"consuming: {source_title}"
+
+    def _cleanup_page_and_index() -> None:
+        """Best-effort: remove the page + revert the index so the tree is clean
+        again after an add/commit failure."""
+        try:
+            site_path.unlink(missing_ok=True)
+        except OSError as unlink_exc:
+            logger.warning("Could not unlink %s: %s", site_path, unlink_exc)
+        if index_existed:
+            # Restore the committed version of the index (discards our edit).
+            _git_ok(["checkout", "HEAD", "--", rel_paths[1]], cwd=site_root)
+
+    try:
+        _git(["add", "--", *rel_paths], cwd=site_root)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        _cleanup_page_and_index()
+        # Unstage anything that did get staged before the failure.
+        _git_ok(["reset", "HEAD", "--", *rel_paths], cwd=site_root)
+        return _result(
+            status="error",
+            slug=slug,
+            site_path=site_path,
+            error=f"git add failed: {stderr or exc}",
+        )
+
+    try:
+        _git(["commit", "-m", commit_message], cwd=site_root)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        _git_ok(["reset", "HEAD", "--", *rel_paths], cwd=site_root)
+        _cleanup_page_and_index()
+        return _result(
+            status="error",
+            slug=slug,
+            site_path=site_path,
+            error=f"git commit failed: {stderr or exc}",
+        )
+
+    commit_sha = _current_head(site_root)
+
+    # Sanity-check: HEAD should be exactly one commit ahead of head_before_commit.
+    try:
+        parent = _git(["rev-parse", f"{commit_sha}^"], cwd=site_root).stdout.strip()
+    except subprocess.CalledProcessError:
+        parent = ""
+    if parent != head_before_commit:
+        msg = (
+            "HEAD moved unexpectedly between commit and push "
+            f"(expected parent={head_before_commit}, got parent={parent}); "
+            "aborting push. Manual recovery needed: inspect git log in "
+            f"{site_root}, then either `git reset --soft {head_before_commit}` "
+            f"to undo, or `git push origin main` to accept the commit. After "
+            f"recovery, remove the #publish tag from {clipping_md_path} and "
+            "re-tag to retry."
+        )
+        logger.error(msg)
+        return _result(
+            status="manual_recovery",
+            slug=slug,
+            site_path=site_path,
+            commit_sha=commit_sha,
+            error=msg,
+        )
+
+    # --- 11. push ---
+    push_proc = _git_ok(["push", "origin", "main"], cwd=site_root)
+    if push_proc.returncode != 0:
+        stderr = (push_proc.stderr or "").strip()
+        msg = f"git push failed (returncode={push_proc.returncode}): {stderr}"
+        logger.error(msg)
+
+        # P1-safe rollback, mirroring publish_note: soft-reset our commit, make
+        # sure ONLY our files are dirty, then targeted cleanup. Our commit
+        # touches the page AND (maybe) the index, so the "expected dirty set"
+        # is `rel_paths` rather than a single file.
+        ok_parent, parent_out = _try_recovery_git(
+            ["rev-parse", "HEAD~1"], site_root, "parent-sanity"
+        )
+        if not ok_parent:
+            recovery_msg = (
+                f"Push failed AND rollback step 'parent-sanity' (git rev-parse "
+                f"HEAD~1) failed: {parent_out}. The local commit {commit_sha} "
+                f"is still in HEAD. Manual recovery needed in {site_root}. "
+                f"Source clipping: {clipping_md_path}. Original push error: "
+                f"{stderr}"
+            )
+            logger.error(recovery_msg)
+            return _result(
+                status="manual_recovery", slug=slug, site_path=site_path,
+                commit_sha=commit_sha, error=recovery_msg,
+            )
+        if parent_out.strip() != head_before_commit:
+            recovery_msg = (
+                f"Push failed AND HEAD has moved unexpectedly since our commit. "
+                f"Local commit was {commit_sha} on top of {head_before_commit}, "
+                f"but HEAD~1 is now {parent_out.strip()!r}. Manual recovery "
+                f"needed: check `git log` in {site_root}. Source clipping: "
+                f"{clipping_md_path}. Original push error: {stderr}"
+            )
+            logger.error(recovery_msg)
+            return _result(
+                status="manual_recovery", slug=slug, site_path=site_path,
+                commit_sha=commit_sha, error=recovery_msg,
+            )
+
+        ok_reset, reset_out = _try_recovery_git(
+            ["reset", "--soft", head_before_commit], site_root, "soft-reset"
+        )
+        if not ok_reset:
+            recovery_msg = (
+                f"Push failed AND rollback step 'soft-reset' "
+                f"(git reset --soft {head_before_commit}) failed: {reset_out}. "
+                f"The local commit {commit_sha} is still in HEAD. Refusing "
+                f"further rollback to avoid data loss. Manual recovery needed "
+                f"in {site_root}. Source clipping: {clipping_md_path}. Original "
+                f"push error: {stderr}"
+            )
+            logger.error(recovery_msg)
+            return _result(
+                status="manual_recovery", slug=slug, site_path=site_path,
+                commit_sha=commit_sha, error=recovery_msg,
+            )
+
+        ok_status, status_out = _try_recovery_git(
+            ["status", "--porcelain"], site_root, "status-after-reset"
+        )
+        if not ok_status:
+            recovery_msg = (
+                f"Push failed AND rollback step 'status-after-reset' "
+                f"(git status --porcelain) failed: {status_out}. The soft-reset "
+                f"succeeded but we cannot verify the working tree is safe to "
+                f"clean up. Manual recovery needed in {site_root}. Source "
+                f"clipping: {clipping_md_path}. Original push error: {stderr}"
+            )
+            logger.error(recovery_msg)
+            return _result(
+                status="manual_recovery", slug=slug, site_path=site_path,
+                commit_sha=commit_sha, error=recovery_msg,
+            )
+
+        def _path_from_porcelain(line: str) -> str:
+            body = line[3:] if len(line) >= 3 else line
+            if " -> " in body:
+                body = body.split(" -> ", 1)[1]
+            return body.strip().strip('"')
+
+        expected = set(rel_paths)
+        unrelated = [
+            line for line in status_out.splitlines() if line.strip()
+            and _path_from_porcelain(line) not in expected
+        ]
+        if unrelated:
+            recovery_msg = (
+                f"Push failed AND {site_root} has unrelated uncommitted changes. "
+                f"Refusing to auto-rollback to avoid data loss. Unrelated status "
+                f"lines: {unrelated!r}. Manual recovery: review `git status` in "
+                f"{site_root}. Source clipping: {clipping_md_path}. Original "
+                f"push error: {stderr}"
+            )
+            logger.error(recovery_msg)
+            return _result(
+                status="manual_recovery", slug=slug, site_path=site_path,
+                commit_sha=commit_sha, error=recovery_msg,
+            )
+
+        # Targeted cleanup: unstage our files, remove the page, restore the index.
+        ok_unstage, unstage_out = _try_recovery_git(
+            ["reset", "HEAD", "--", *rel_paths], site_root, "unstage-our-files"
+        )
+        if not ok_unstage:
+            recovery_msg = (
+                f"Push failed AND rollback step 'unstage-our-files' "
+                f"(git reset HEAD -- {rel_paths}) failed: {unstage_out}. "
+                f"Refusing to clean up when we cannot guarantee the index "
+                f"state. Manual recovery needed in {site_root}. Source "
+                f"clipping: {clipping_md_path}. Original push error: {stderr}"
+            )
+            logger.error(recovery_msg)
+            return _result(
+                status="manual_recovery", slug=slug, site_path=site_path,
+                commit_sha=commit_sha, error=recovery_msg,
+            )
+
+        try:
+            site_path.unlink(missing_ok=True)
+        except OSError as unlink_exc:
+            logger.warning(
+                "Could not unlink %s after push rollback: %s",
+                site_path, unlink_exc,
+            )
+        if index_existed:
+            _try_recovery_git(
+                ["checkout", "HEAD", "--", rel_paths[1]],
+                site_root, "restore-index",
+            )
+
+        logger.warning(
+            "Push failed; rolled back local commit %s back to %s and removed %s",
+            commit_sha, head_before_commit, rel_site_path,
+        )
+        return _result(
+            status="error",
+            slug=slug,
+            site_path=site_path,
+            commit_sha=commit_sha,
+            error=msg,
+        )
+
+    # --- 12. success: write `published_at` back to the source clipping ---
+    published_at_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    wrote_back = _write_source_published_at(clipping_md_path, published_at_iso)
+    if wrote_back:
+        logger.info(
+            "[clipping] wrote published_at=%s back to %s",
+            published_at_iso, clipping_md_path.name,
+        )
+        result_published_at: str | None = published_at_iso
+    else:
+        logger.warning(
+            "[clipping] could not write published_at back to %s; publish still "
+            "considered successful, but the source frontmatter was NOT updated.",
+            clipping_md_path,
+        )
+        result_published_at = None
+
+    logger.info(
+        "[clipping] DONE %s -> %s (commit=%s, hash=%s, source_updated=%s)",
+        clipping_md_path.name, slug,
         commit_sha[:8] if commit_sha else "?", content_hash[:12], wrote_back,
     )
     return _result(

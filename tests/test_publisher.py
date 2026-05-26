@@ -192,18 +192,26 @@ def tmp_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     transcript_dir = tmp_path / "transcripts"
     transcript_dir.mkdir()
+    clippings_dir = tmp_path / "clippings"  # NOT created -- mirror real behavior
     drafts_dir = tmp_path / "drafts"
     drafts_dir.mkdir()
     ledger_path = tmp_path / ".published.json"
 
     notes_dir = site / "src" / "pages" / "notes"
+    consuming_dir = site / "src" / "pages" / "consuming"
 
     # Patch config module attrs. Publishing is opt-in via NOTES_SITE_ROOT, so
     # the tests stand in a real (tmp) site repo: SITE_ROOT / SITE_NOTES_DIR are
     # set and PUBLISH_ENABLED is flipped True. (SITE_REFERENCE_NOTE was removed
     # along with the old LLM publish-cleanup pass, so it's no longer patched.)
+    # CLIPPINGS_DIR / SITE_CONSUMING_DIR are patched to tmp dirs so the clipping
+    # scan never touches the real vault, and so note-only tests stay hermetic
+    # (the clippings dir is intentionally NOT created, matching production).
     monkeypatch.setattr(config, "SITE_ROOT", site)
     monkeypatch.setattr(config, "SITE_NOTES_DIR", notes_dir)
+    monkeypatch.setattr(config, "SITE_CONSUMING_DIR", consuming_dir)
+    monkeypatch.setattr(config, "CLIPPINGS_DIR", clippings_dir)
+    monkeypatch.setattr(config, "CLIPPING_COMMENT_FIELD", "comment")
     monkeypatch.setattr(config, "PUBLISH_ENABLED", True)
     monkeypatch.setattr(config, "TRANSCRIPT_DIR", transcript_dir)
     monkeypatch.setattr(config, "DRAFTS_DIR", drafts_dir)
@@ -214,9 +222,11 @@ def tmp_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         site=site,
         bare=bare,
         transcript_dir=transcript_dir,
+        clippings_dir=clippings_dir,
         drafts_dir=drafts_dir,
         ledger_path=ledger_path,
         notes_dir=notes_dir,
+        consuming_dir=consuming_dir,
     )
 
 

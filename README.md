@@ -29,7 +29,9 @@ deterministically reformatted into your site's note format and pushed to git.
    tagging a note with `#publish` triggers a 60-second poll → deterministic
    reformat into the site's note format → draft → static-site copy → git
    commit + push. No LLM is called at publish time — the only LLM use is the
-   Gemini transcript cleanup at recording time.
+   Gemini transcript cleanup at recording time. Web **clippings** tagged
+   `#publish` are similarly mirrored to the site's `/consuming` section
+   (your commentary + a link to the original + the clipped content).
 8. Tray app auto-starts on Windows login via Task Scheduler.
 
 ---
@@ -88,6 +90,10 @@ strictly required. Highlights:
 | `NOTES_DAILY_SUBDIR` | | `Daily Notes` | Subfolder for daily notes. |
 | `NOTES_SITE_ROOT` | optional | _(disabled)_ | Static-site repo to publish `#publish` notes into. Leave unset to disable publishing. |
 | `NOTES_SITE_NOTES_SUBDIR` | | `src/pages/notes` | Where note markdown is dropped inside the site repo. |
+| `NOTES_CLIPPINGS_VAULT_SUBDIR` | | `Clippings` | Vault subfolder holding web clippings to mirror to `/consuming`. |
+| `NOTES_SITE_CONSUMING_SUBDIR` | | `src/pages/consuming` | Where clipping pages are dropped inside the site repo. |
+| `NOTES_CLIPPING_COMMENT_FIELD` | | `comment` | Clipping frontmatter field holding your commentary. |
+| `NOTES_CLIPPING_PREVIEW_CHARS` | | `1000` | Max chars of a clipped body to show before the fade-out preview + "read at the source" link. |
 | `NOTES_HOTKEY` | | `<cmd>+<alt>+<space>` | pynput hotkey combo (`<cmd>` = Win key). |
 | `GEMINI_MODEL_PRIMARY` / `GEMINI_MODEL_FALLBACK` | | see `.env.example` | Override the models. |
 
@@ -118,6 +124,22 @@ API cost or privacy exposure at publish time), drops a draft in
 `drafts/<slug>.md`, copies to `<site>/src/pages/notes/<slug>.md`, and pushes to
 `origin/main`. (Publishing relies on your existing git credentials for that
 repo — nothing is stored here.)
+
+### Publish web clippings to `/consuming`
+
+The same opt-in publishing feature (it needs `NOTES_SITE_ROOT`) can also mirror
+your saved Obsidian **web clippings** to the site's **`/consuming`** section.
+Save a page into your vault's clippings folder (default `Clippings/`), tag it
+`#publish` (frontmatter `tags:` or body), and optionally add a `comment:` field
+with your own take. Within 60 s the watcher turns it into a
+`/consuming/<Title-Case-Slug>` page laid out as: **your commentary on top**, a
+link back to the original source, a short disclaimer that it's a mirror, and
+then a **truncated preview** of the clipped content (the opening only, with a
+fade-out and a "Read the full version at the source →" link; controlled by
+`NOTES_CLIPPING_PREVIEW_CHARS`, default 1000). It's also **auto-linked in the consuming index**
+(grouped by year → month, reverse-chronological). Editing the comment or the
+clipped body and waiting a tick republishes in place. This is fully
+**deterministic** — no LLM is involved, exactly like note publishing.
 
 ### Retry a failed transcription
 

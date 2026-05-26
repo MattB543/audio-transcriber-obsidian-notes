@@ -35,8 +35,13 @@ TRANSCRIPT_DIR = <audio>/<NOTES_TRANSCRIPT_SUBDIR>       # default "transcriptio
 DAILY_DIR      = <vault>/<NOTES_DAILY_SUBDIR>            # default "Daily Notes"
 
 # Static site (optional)              (env: NOTES_SITE_ROOT)
-SITE_ROOT      = <site root>
-SITE_NOTES_DIR = <site>/<NOTES_SITE_NOTES_SUBDIR>        # default "src/pages/notes"
+SITE_ROOT          = <site root>
+SITE_NOTES_DIR     = <site>/<NOTES_SITE_NOTES_SUBDIR>      # default "src/pages/notes"
+SITE_CONSUMING_DIR = <site>/<NOTES_SITE_CONSUMING_SUBDIR>  # default "src/pages/consuming"
+
+# Web clippings (optional)            (env: NOTES_CLIPPINGS_VAULT_SUBDIR)
+CLIPPINGS_DIR        = <vault>/<NOTES_CLIPPINGS_VAULT_SUBDIR>   # default "Clippings" (never auto-created)
+CLIPPING_PREVIEW_CHARS = <int>                                 # env NOTES_CLIPPING_PREVIEW_CHARS, default 1000
 
 # Env file
 ENV_FILE       = <repo root>/.env                        # contains GEMINI_API_KEY
@@ -184,11 +189,19 @@ Ensures `Daily Notes/YYYY-MM-DD.md` exists (create with minimal frontmatter if m
 
 ### Publisher watcher
 
-Polls `TRANSCRIPT_DIR/*.md` every 60s. For any file where:
+Polls `TRANSCRIPT_DIR/*.md` AND `CLIPPINGS_DIR/*.md` (if the clippings dir
+exists) every 60s. For any file where:
 - YAML `tags` list contains `publish`, OR
 - File body contains `#publish` as a tag
 
-...AND the file has not yet been published (check a local ledger `notes-pipeline/.published.json`), trigger the publish pipeline. Update ledger on success. If `git push` fails, leave file unmarked and log.
+...AND the file has not yet been published (or its content hash changed; check
+the local ledger `notes-pipeline/.published.json`), trigger the publish
+pipeline. Sources under `CLIPPINGS_DIR` route to `publish_clipping` (and use the
+clipping content hash, title + comment + body); everything else routes to
+`publish_note` (title + transcript hash). The ledger and blocked ledger are
+keyed by absolute source path and hold both kinds. Update ledger on success. If
+`git push` fails, roll back and leave the file unmarked (or block it on an
+unsafe-to-auto-recover state) and log.
 
 ### Publish pipeline
 
@@ -203,6 +216,40 @@ used only for transcript cleanup at transcription time.)
 5. Copy draft to `<site>/src/pages/notes/<slug>.md`
 6. `git add src/pages/notes/<slug>.md && git commit -m "note: <title>" && git push origin main`
 7. Record success in `.published.json` with timestamp + slug + site commit sha
+
+### Clipping → /consuming flow (opt-in, deterministic, no LLM)
+
+A PARALLEL flow to note publishing, also gated on `NOTES_SITE_ROOT`. The watcher
+additionally scans `CLIPPINGS_DIR` (if it exists) each tick for `#publish`-tagged
+Obsidian web clippings and routes them to `publisher.publish.publish_clipping`.
+
+1. Parse the clipping frontmatter (`title`, `source` [URL], `author` [list of
+   `[[wikilink]]`s or a string], `created` [date], `description`, and the
+   comment field named by `NOTES_CLIPPING_COMMENT_FIELD`, default `comment`).
+   A non-empty `title` is required.
+2. Slug: Title-Case-hyphen (e.g. `AI-Tools-for-Existential-Security-EA-Forum`)
+   via `_consuming_slugify`, collision-resolved against `SITE_CONSUMING_DIR`.
+3. Build a deterministic `/consuming/<Slug>` page: frontmatter
+   (`source: clipping`, `layout`, `backLink/backText`, `created`, `description`),
+   then **your commentary** under `## My commentary` (omitted entirely when
+   there's no comment), a `**Source:**` link + `By <authors> · clipped <date>`
+   byline + a mirror disclaimer, then a **truncated preview** of the clipped
+   body. Bodies longer than `CLIPPING_PREVIEW_CHARS` (env
+   `NOTES_CLIPPING_PREVIEW_CHARS`, default `1000`) are cut at a clean
+   paragraph/sentence/word boundary (never mid-word), rendered as normal
+   markdown, then followed by a self-contained fade-out `<div>` (inline styles,
+   gradient to `var(--color-bg)`) holding a "Read the full version at the
+   source →" link. Bodies at/under the limit are shown in full with no fade/CTA.
+   If truncated but no source URL was recorded, the fade `<div>` shows a plain
+   "Full text not mirrored" note instead of a link.
+4. Update the consuming `index.md`: insert/replace a
+   `- **[Title](/consuming/Slug)** - description` bullet, grouped `## YYYY` →
+   `### Month` (years + months descending), idempotent on republish, preserving
+   the intro paragraph(s) and trailing structure comment.
+5. Stage BOTH the page and the index, commit `consuming: <title>`, push once.
+6. Content hash = `sha256(title + comment + body)` (separate from the
+   transcript hash) so editing the comment OR the body republishes in place.
+   Mirror the `published_at` writeback into the source clipping.
 
 ## Cleanup prompt (for `transcribe.cleanup.py`)
 

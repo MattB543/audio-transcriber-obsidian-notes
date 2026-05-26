@@ -45,6 +45,14 @@ TRANSCRIPT_DIR: Path = AUDIO_DIR / os.environ.get(
     "NOTES_TRANSCRIPT_SUBDIR", "transcriptions"
 )
 DAILY_DIR: Path = VAULT_ROOT / os.environ.get("NOTES_DAILY_SUBDIR", "Daily Notes")
+# Obsidian web-clippings folder. Clippings tagged `#publish` are mirrored to the
+# site's /consuming section (see publisher.publish.publish_clipping). Unlike the
+# other vault subdirs we do NOT auto-create this on import (see the dir-creation
+# guard at the bottom): not every vault has a clippings folder, and we only read
+# from it -- never write -- so a phantom empty dir would be misleading.
+CLIPPINGS_DIR: Path = VAULT_ROOT / os.environ.get(
+    "NOTES_CLIPPINGS_VAULT_SUBDIR", "Clippings"
+)
 
 # --- personal-site publishing (OPT-IN, disabled by default) -----------------
 # The "#publish" feature copies a cleaned note into a static-site repo and
@@ -64,6 +72,21 @@ SITE_NOTES_DIR: Path | None = (
     if SITE_ROOT is not None
     else None
 )
+# Where mirrored web clippings are dropped inside the site repo (the
+# /consuming section). None when publishing is disabled, like SITE_NOTES_DIR.
+SITE_CONSUMING_DIR: Path | None = (
+    SITE_ROOT / os.environ.get("NOTES_SITE_CONSUMING_SUBDIR", "src/pages/consuming")
+    if SITE_ROOT is not None
+    else None
+)
+# Name of the clipping frontmatter field holding the user's commentary. The
+# clipping page renders this under a "## My commentary" heading when present.
+CLIPPING_COMMENT_FIELD: str = os.environ.get("NOTES_CLIPPING_COMMENT_FIELD", "comment")
+# How many characters of the mirrored clipping body to show on the published
+# /consuming page before truncating to a fade-out preview + "read the full
+# version at the source" call-to-action. Bodies at or under this length are
+# shown in full (they're already complete). See publisher.publish._build_consuming_md.
+CLIPPING_PREVIEW_CHARS: int = int(os.environ.get("NOTES_CLIPPING_PREVIEW_CHARS", "1000"))
 
 # --- repo-local paths -------------------------------------------------------
 DRAFTS_DIR: Path = NP_ROOT / "drafts"

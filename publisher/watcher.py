@@ -33,13 +33,43 @@ import yaml
 import config
 from publisher.publish import (
     PublishResult,
+    _compute_clipping_content_hash,
     _compute_content_hash,
     _extract_transcript_section,
     _split_frontmatter,
+    publish_clipping,
     publish_note,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Source kind routing
+# ---------------------------------------------------------------------------
+
+
+def _is_clipping_source(source_path: Path) -> bool:
+    """True iff ``source_path`` lives under ``config.CLIPPINGS_DIR``.
+
+    Used to route a source to the clipping publisher + clipping hash instead of
+    the transcript ones. Resolves both paths so symlinks / case differences on
+    Windows compare correctly; falls back to a best-effort string check if the
+    path can't be resolved (e.g. the file was deleted mid-scan).
+    """
+    clippings_dir = getattr(config, "CLIPPINGS_DIR", None)
+    if clippings_dir is None:
+        return False
+    try:
+        src = Path(source_path).resolve()
+        root = Path(clippings_dir).resolve()
+    except OSError:
+        return False
+    try:
+        src.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -48,11 +78,15 @@ logger = logging.getLogger(__name__)
 
 
 def _hash_for_source(source_path: Path) -> str | None:
-    """Compute the content hash of a source `.md` file (title + transcript).
+    """Compute the content hash of a source `.md` file.
 
-    Returns None if the file can't be read or has no transcript section.
-    Mirrors what `publish.py:publish_note` would hash so the comparison is
-    apples-to-apples.
+    Routes by source kind so the comparison is apples-to-apples with whatever
+    the publisher hashed:
+      - clippings (under ``config.CLIPPINGS_DIR``) hash title + comment + body
+        (so editing the comment OR the mirrored body triggers a republish),
+      - transcripts hash title + transcript section (unchanged behavior).
+
+    Returns None if the file can't be read or has no meaningful content.
     """
     try:
         md = source_path.read_text(encoding="utf-8")
@@ -60,6 +94,15 @@ def _hash_for_source(source_path: Path) -> str | None:
         return None
     fm, body = _split_frontmatter(md)
     title = str(fm.get("title", "")).strip()
+
+    if _is_clipping_source(source_path):
+        comment_field = getattr(config, "CLIPPING_COMMENT_FIELD", "comment")
+        comment_raw = fm.get(comment_field)
+        comment = "" if comment_raw is None else str(comment_raw).strip()
+        if not title and not comment and not body.strip():
+            return None
+        return _compute_clipping_content_hash(title, comment, body)
+
     transcript = _extract_transcript_section(body)
     if not title and not transcript:
         return None
@@ -387,20 +430,96 @@ def _iter_candidate_files(transcript_dir: Path) -> Iterable[Path]:
         yield p
 
 
-def scan_for_publishable(
-    *,
-    transcript_dir: Path | None = None,
-    ledger: PublishedLedger | None = None,
-    blocked_ledger: BlockedLedger | None = None,
-) -> list[Path]:
-    """Return transcript md files that should be (re)published right now.
+def _iter_candidate_clippings(clippings_dir: Path) -> Iterable[Path]:
+    """Yield `*.md` clipping files in ``clippings_dir``.
 
-    A file is included if all of:
+    Skips the dir entirely if it doesn't exist (we never auto-create it — see
+    config.py). Unlike transcripts there is no `.raw.md` convention here.
+    """
+    if not clippings_dir.exists():
+        return
+    for p in sorted(clippings_dir.glob("*.md")):
+        yield p
+
+
+def _is_publishable(
+    path: Path,
+    *,
+    ledger: PublishedLedger,
+    blocked_ledger: BlockedLedger,
+) -> bool:
+    """Decide whether a single candidate `.md` should be (re)published now.
+
+    Shared by transcript and clipping scanning — `_hash_for_source` is
+    kind-aware, so the first-time / republish-on-change logic is identical.
+
+    Returns True if all of:
       - it has the `#publish` tag (frontmatter or body)
       - it's NOT in the blocked ledger
       - it's either (a) not in the published ledger at all, OR (b) in the
-        ledger but its current content hash differs from the recorded one
-        (the user edited the title or body since the last publish).
+        ledger but its current content hash differs from the recorded one.
+    """
+    if blocked_ledger.contains_source(path):
+        logger.debug(
+            "Skipping %s: source is in blocked ledger (manual recovery "
+            "required; clear via publisher.watcher.clear_blocked).",
+            path,
+        )
+        return False
+    try:
+        md = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning("Could not read %s: %s", path, exc)
+        return False
+    try:
+        if not _has_publish_tag(md):
+            return False
+    except yaml.YAMLError as exc:
+        logger.warning("Skipping %s: bad YAML (%s)", path, exc)
+        return False
+
+    # Has #publish. Decide first-time vs republish-on-change.
+    prev_hash = ledger.hash_for_source(path)
+    if prev_hash is None and ledger.contains_source(path):
+        # Old ledger entry without hash -- republish once to populate it.
+        logger.info(
+            "Re-publishing %s: ledger entry has no content_hash (old format).",
+            path.name,
+        )
+        return True
+    if prev_hash is None:
+        # Never published.
+        return True
+    # Already published; compare hashes.
+    current_hash = _hash_for_source(path)
+    if current_hash is None:
+        logger.debug("Could not compute hash for %s; skipping.", path)
+        return False
+    if current_hash != prev_hash:
+        logger.info(
+            "Re-publishing %s: content changed (hash %s -> %s).",
+            path.name, prev_hash[:12], current_hash[:12],
+        )
+        return True
+    # Content unchanged.
+    return False
+
+
+def scan_for_publishable(
+    *,
+    transcript_dir: Path | None = None,
+    clippings_dir: Path | None = None,
+    ledger: PublishedLedger | None = None,
+    blocked_ledger: BlockedLedger | None = None,
+) -> list[Path]:
+    """Return transcript AND clipping md files that should be (re)published now.
+
+    A file is included if it has the `#publish` tag, is not blocked, and is
+    either never published or has changed since last publish (see
+    :func:`_is_publishable`). Both the transcript dir and the clippings dir
+    (if it exists) are scanned each pass; the returned paths can be a mix of
+    both kinds — the caller routes each to the right publisher via
+    :func:`_is_clipping_source`.
 
     Blocked sources (manual-recovery cases) are skipped so the watcher does
     not retry a publish that left the local repo in an unsafe-to-auto-touch
@@ -408,6 +527,8 @@ def scan_for_publishable(
     ledger file directly.
     """
     transcript_dir = transcript_dir or config.TRANSCRIPT_DIR
+    if clippings_dir is None:
+        clippings_dir = getattr(config, "CLIPPINGS_DIR", None)
     ledger = ledger or PublishedLedger()
     blocked_ledger = blocked_ledger or BlockedLedger(
         path=_blocked_ledger_path(ledger.path)
@@ -415,51 +536,14 @@ def scan_for_publishable(
 
     out: list[Path] = []
     for path in _iter_candidate_files(transcript_dir):
-        if blocked_ledger.contains_source(path):
-            logger.debug(
-                "Skipping %s: source is in blocked ledger (manual recovery "
-                "required; clear via publisher.watcher.clear_blocked).",
-                path,
-            )
-            continue
-        try:
-            md = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            logger.warning("Could not read %s: %s", path, exc)
-            continue
-        try:
-            if not _has_publish_tag(md):
-                continue
-        except yaml.YAMLError as exc:
-            logger.warning("Skipping %s: bad YAML (%s)", path, exc)
-            continue
-
-        # Has #publish. Decide first-time vs republish-on-change.
-        prev_hash = ledger.hash_for_source(path)
-        if prev_hash is None and ledger.contains_source(path):
-            # Old ledger entry without hash -- republish once to populate it.
-            logger.info(
-                "Re-publishing %s: ledger entry has no content_hash (old format).",
-                path.name,
-            )
+        if _is_publishable(path, ledger=ledger, blocked_ledger=blocked_ledger):
             out.append(path)
-            continue
-        if prev_hash is None:
-            # Never published.
-            out.append(path)
-            continue
-        # Already published; compare hashes.
-        current_hash = _hash_for_source(path)
-        if current_hash is None:
-            logger.debug("Could not compute hash for %s; skipping.", path)
-            continue
-        if current_hash != prev_hash:
-            logger.info(
-                "Re-publishing %s: content changed (hash %s -> %s).",
-                path.name, prev_hash[:12], current_hash[:12],
-            )
-            out.append(path)
-        # else: content unchanged, skip.
+    if clippings_dir is not None:
+        for path in _iter_candidate_clippings(Path(clippings_dir)):
+            if _is_publishable(
+                path, ledger=ledger, blocked_ledger=blocked_ledger
+            ):
+                out.append(path)
     return out
 
 
@@ -485,10 +569,17 @@ def _process_one(
     # loop on every subsequent edit).
     existing_slug = ledger.slug_for_source(path)
 
+    # Route to the right publisher: clippings under CLIPPINGS_DIR -> /consuming,
+    # everything else -> the notes flow. Both return a PublishResult and share
+    # the same ledger (keyed by absolute source path).
+    is_clipping = _is_clipping_source(path)
+    publisher_fn = publish_clipping if is_clipping else publish_note
+    kind = "clipping" if is_clipping else "note"
+
     try:
-        result = publish_note(path, existing_slug=existing_slug)
-    except Exception as exc:  # noqa: BLE001 — defensive; publish_note shouldn't raise
-        logger.exception("publish_note raised unexpectedly for %s", path)
+        result = publisher_fn(path, existing_slug=existing_slug)
+    except Exception as exc:  # noqa: BLE001 — defensive; publishers shouldn't raise
+        logger.exception("%s publish raised unexpectedly for %s", kind, path)
         return PublishResult(
             status="error",
             slug=None,
@@ -554,22 +645,30 @@ def _process_one(
 def run_once(
     *,
     transcript_dir: Path | None = None,
+    clippings_dir: Path | None = None,
     ledger: PublishedLedger | None = None,
     blocked_ledger: BlockedLedger | None = None,
 ) -> list[PublishResult]:
-    """Do a single scan + publish pass. Returns all results (errors included)."""
+    """Do a single scan + publish pass (notes AND clippings). Returns all
+    results (errors included)."""
     ledger = ledger or PublishedLedger()
     blocked_ledger = blocked_ledger or BlockedLedger(
         path=_blocked_ledger_path(ledger.path)
     )
     transcript_dir = transcript_dir or config.TRANSCRIPT_DIR
+    if clippings_dir is None:
+        clippings_dir = getattr(config, "CLIPPINGS_DIR", None)
     candidates = scan_for_publishable(
         transcript_dir=transcript_dir,
+        clippings_dir=clippings_dir,
         ledger=ledger,
         blocked_ledger=blocked_ledger,
     )
     if not candidates:
-        logger.debug("run_once: no new publishable notes in %s", transcript_dir)
+        logger.debug(
+            "run_once: no new publishable notes/clippings in %s / %s",
+            transcript_dir, clippings_dir,
+        )
         return []
 
     logger.info("run_once: %d candidate(s): %s", len(candidates), [p.name for p in candidates])
@@ -592,9 +691,11 @@ def _handle_stop(signum: int, _frame: object) -> None:  # pragma: no cover
 def run_forever(
     *,
     transcript_dir: Path | None = None,
+    clippings_dir: Path | None = None,
     poll_seconds: int | None = None,
 ) -> None:
-    """Poll forever. Ctrl+C or SIGTERM causes a clean exit after the current tick.
+    """Poll forever (notes AND clippings). Ctrl+C or SIGTERM causes a clean exit
+    after the current tick.
 
     Publishing is opt-in: if NOTES_SITE_ROOT is unset (``config.PUBLISH_ENABLED``
     is False / ``config.SITE_ROOT`` is None) we log and return immediately rather
@@ -609,6 +710,8 @@ def run_forever(
         return
 
     poll_seconds = poll_seconds if poll_seconds is not None else config.WATCHER_POLL_SECONDS
+    if clippings_dir is None:
+        clippings_dir = getattr(config, "CLIPPINGS_DIR", None)
     ledger = PublishedLedger()
     blocked_ledger = BlockedLedger(path=_blocked_ledger_path(ledger.path))
 
@@ -623,8 +726,9 @@ def run_forever(
         pass
 
     logger.info(
-        "Publisher watcher starting (transcript_dir=%s, poll=%ss)",
+        "Publisher watcher starting (transcript_dir=%s, clippings_dir=%s, poll=%ss)",
         transcript_dir or config.TRANSCRIPT_DIR,
+        clippings_dir,
         poll_seconds,
     )
     global _stop_requested
@@ -634,6 +738,7 @@ def run_forever(
         try:
             run_once(
                 transcript_dir=transcript_dir,
+                clippings_dir=clippings_dir,
                 ledger=ledger,
                 blocked_ledger=blocked_ledger,
             )
