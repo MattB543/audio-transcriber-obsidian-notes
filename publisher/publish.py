@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import html
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -282,6 +283,49 @@ def _pretty_source(url: str) -> str:
     return host
 
 
+def _source_domain(url: str) -> str:
+    """Return the bare host for ``url`` with any leading ``www.`` stripped.
+
+    e.g. ``https://www.example.com/a/b`` -> ``example.com``. Returns "" when the
+    URL is blank or cannot be parsed into a host. Never raises.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit
+
+        host = urlsplit(url).netloc
+    except (ValueError, ImportError):  # pragma: no cover — defensive
+        return ""
+    if not host:
+        return ""
+    # Drop any userinfo/port if present, then a leading www.
+    host = host.split("@")[-1].split(":")[0]
+    if host.lower().startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _site_url_path(subdir: str) -> str:
+    """Map a site source subdir to the public URL path Astro serves it at.
+
+    e.g. ``src/pages/consuming`` -> ``/consuming/``. Everything up to and
+    including ``src/pages/`` is stripped; the remainder is wrapped in slashes.
+    Falls back to ``/`` when the remainder is empty. Backslashes are normalized
+    to forward slashes so a Windows-style subdir still maps correctly.
+    """
+    norm = (subdir or "").replace("\\", "/").strip("/")
+    marker = "src/pages"
+    idx = norm.find(marker)
+    if idx != -1:
+        norm = norm[idx + len(marker):]
+    norm = norm.strip("/")
+    if not norm:
+        return "/"
+    return f"/{norm}/"
+
+
 def _comment_excerpt(comment: str) -> str:
     """First N chars of the comment as a one-line meta/index description.
 
@@ -365,18 +409,28 @@ def _build_consuming_md(
     authors: str,
     created_iso: str,
     clipping_body: str,
+    back_link: str = "/consuming/",
 ) -> str:
     """Build the deterministic /consuming page markdown for a web clipping.
 
-    SECTIONED template (approved):
+    CARD template (approved):
 
       - frontmatter (title, layout, backLink/backText, source: clipping,
         created, description)
-      - "## My commentary" + the comment, then a `---` divider (OMITTED
-        entirely when there is no comment)
-      - a "**Source:**" line + "By <authors> · clipped <date>" byline + a
-        disclaimer blockquote, then a `---` divider
+      - ONE self-contained raw-HTML "card" (inline styles only) placed right
+        after the frontmatter and before the body. The card holds, in order:
+          * the comment (escaped, newlines -> ``<br>``) — OMITTED when there is
+            no comment, in which case the card starts with the meta line;
+          * a muted meta line joining the present pieces with " · ": a source
+            link (``<a href>domain</a>``, ``www.`` stripped) or the literal
+            "original URL not recorded"; "by <authors>"; "clipped <date>";
+          * a smaller italic disclaimer line whose wording depends on whether
+            the body is truncated and whether a source URL exists.
       - the mirrored clipping body as a TRUNCATED PREVIEW (see below)
+
+    Per CommonMark, markdown inside a block-level ``<div>`` is NOT re-parsed, so
+    the card content is plain HTML: user text is escaped with ``html.escape``
+    and comment newlines become ``<br>``.
 
     Body preview behaviour (``config.CLIPPING_PREVIEW_CHARS``):
       - If the body is longer than the preview limit, only the opening is shown
@@ -389,23 +443,12 @@ def _build_consuming_md(
         becomes a plain "Full text not mirrored" note (no link).
 
     The fade block is a self-contained raw ``<div>`` with inline styles only.
-    Per CommonMark, markdown inside a block-level ``<div>`` is NOT re-parsed, so
-    we keep all markdown OUTSIDE the wrapper and only put a plain HTML link
-    inside it.
-
-    Rules for the optional bits:
-      - No comment -> omit the commentary heading/block AND its trailing divider
-        (the page then starts with "**Source:**").
-      - No source URL -> render "**Source:** _(original URL not recorded)_" and
-        word the disclaimer so it does not say "above".
-      - No authors -> omit the "By <authors>" part of the byline.
-      - No created date -> omit "· clipped <date>".
     """
     lines: list[str] = [
         "---",
         f"title: {_yaml_dump_str(title)}",
         "layout: ../../layouts/Layout.astro",
-        "backLink: ./",
+        f"backLink: {back_link}",
         "backText: Consuming",
         "source: clipping",
         f"created: {created_iso}",
@@ -414,63 +457,62 @@ def _build_consuming_md(
         "",
     ]
 
-    comment_text = (comment or "").strip()
-    if comment_text:
-        lines.append("## My commentary")
-        lines.append("")
-        lines.append(comment_text)
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-
-    # Source line.
     source_url = (source_url or "").strip()
-    if source_url:
-        pretty = _pretty_source(source_url)
-        lines.append(f"**Source:** [{pretty}]({source_url})")
-    else:
-        lines.append("**Source:** _(original URL not recorded)_")
-
-    # Byline: "By <authors> · clipped <date>". Each half is optional.
-    byline_bits: list[str] = []
-    authors = (authors or "").strip()
-    if authors:
-        byline_bits.append(f"By {authors}")
-    created = (created_iso or "").strip()
-    if created:
-        byline_bits.append(f"clipped {created}")
-    if byline_bits:
-        lines.append(" · ".join(byline_bits))
-
-    lines.append("")
-    # Disclaimer blockquote. We now publish a short PREVIEW of the body, so the
-    # wording points the reader at the source for the full thing. When there's
-    # no source URL we can't point "above", so we soften it.
     body_text = (clipping_body or "").strip()
     preview_limit = config.CLIPPING_PREVIEW_CHARS
     truncated = len(body_text) > preview_limit
+
+    # --- the subtle card ---
+    comment_text = (comment or "").strip()
+
+    # META line pieces, joined with " · ".
+    meta_bits: list[str] = []
     if source_url:
-        lines.append(
-            "> Mirrored as a short preview from a web clipping saved in my "
-            "Obsidian —"
-        )
-        lines.append(
-            "> only the opening is shown here. Read the full thing at the "
-            "source above"
-        )
-        lines.append("> (if it's still up).")
+        domain = _source_domain(source_url)
+        href = html.escape(source_url, quote=True)
+        label = html.escape(domain) if domain else href
+        meta_bits.append(f'<a href="{href}">{label}</a>')
     else:
-        lines.append(
-            "> Mirrored as a short preview from a web clipping saved in my "
-            "Obsidian —"
+        meta_bits.append("original URL not recorded")
+    authors = (authors or "").strip()
+    if authors:
+        meta_bits.append(f"by {html.escape(authors)}")
+    created = (created_iso or "").strip()
+    if created:
+        meta_bits.append(f"clipped {html.escape(created)}")
+    meta_html = " · ".join(meta_bits)
+
+    # DISCLAIMER (plain text, escaped).
+    if truncated and source_url:
+        disclaimer = (
+            "Preview clipped from the web into my Obsidian — read the full "
+            "piece at the source."
         )
-        lines.append(
-            "> only the opening is shown here. The original source URL was not "
-            "recorded,"
+    elif truncated and not source_url:
+        disclaimer = (
+            "Preview clipped from the web into my Obsidian. The original URL "
+            "wasn't recorded."
         )
-        lines.append("> so the full version may live elsewhere.")
-    lines.append("")
-    lines.append("---")
+    else:
+        disclaimer = "Clipped from the web into my Obsidian; formatting may be imperfect."
+
+    lines.append(
+        '<div style="border:1px solid var(--color-border); border-radius:8px; '
+        "padding:0.9rem 1.1rem; margin:0 0 2.5rem; background:rgba(0,0,0,0.025); "
+        'font-size:0.95rem; line-height:1.55;">'
+    )
+    if comment_text:
+        comment_html = html.escape(comment_text).replace("\n", "<br>")
+        lines.append(f'  <p style="margin:0 0 0.5rem;">{comment_html}</p>')
+    lines.append(
+        '  <p style="margin:0; color:var(--color-text-muted); '
+        f'font-size:0.82rem;">{meta_html}</p>'
+    )
+    lines.append(
+        '  <p style="margin:0.5rem 0 0; color:var(--color-text-muted); '
+        f'font-size:0.78rem; font-style:italic;">{html.escape(disclaimer)}</p>'
+    )
+    lines.append("</div>")
     lines.append("")
 
     if not truncated:
@@ -819,10 +861,18 @@ def _parse_iso_date(value: str) -> date | None:
         return None
 
 
-def _consuming_index_bullet(title: str, slug: str, description: str) -> str:
-    """Build the single index bullet line for a clipping."""
+def _consuming_index_bullet(
+    title: str, slug: str, description: str, domain: str = ""
+) -> str:
+    """Build the single index bullet line for a clipping.
+
+    Shape: ``- **[Title](/consuming/Slug)** (domain) - description``. The
+    ``(domain)`` part is omitted entirely when ``domain`` is empty.
+    """
     desc = re.sub(r"\s+", " ", (description or "").strip())
-    return f"- **[{title}](/consuming/{slug})** - {desc}"
+    domain = (domain or "").strip()
+    suffix = f" ({domain})" if domain else ""
+    return f"- **[{title}](/consuming/{slug})**{suffix} - {desc}"
 
 
 def _update_consuming_index(
@@ -832,6 +882,7 @@ def _update_consuming_index(
     slug: str,
     description: str,
     entry_date: date,
+    domain: str = "",
 ) -> bool:
     """Insert (or update in place) a clipping bullet in the /consuming index.
 
@@ -855,7 +906,7 @@ def _update_consuming_index(
     """
     year = entry_date.year
     month_name = _MONTH_NAMES[entry_date.month - 1]
-    bullet = _consuming_index_bullet(title, slug, description)
+    bullet = _consuming_index_bullet(title, slug, description, domain)
     link_marker = f"](/consuming/{slug})"
 
     original = index_path.read_text(encoding="utf-8")
@@ -1576,6 +1627,9 @@ def publish_clipping(
     else:
         description = source_title
 
+    back_link = _site_url_path(
+        os.environ.get("NOTES_SITE_CONSUMING_SUBDIR", "src/pages/consuming")
+    )
     consuming_md = _build_consuming_md(
         title=source_title,
         description=description,
@@ -1584,6 +1638,7 @@ def publish_clipping(
         authors=authors,
         created_iso=created_iso,
         clipping_body=clipping_body,
+        back_link=back_link,
     )
     content_hash = _compute_clipping_content_hash(
         source_title, comment, clipping_body
@@ -1664,6 +1719,7 @@ def publish_clipping(
                 slug=slug,
                 description=description,
                 entry_date=entry_date,
+                domain=_source_domain(source_url),
             )
         except OSError as exc:
             # Recover: remove the page we copied so the tree doesn't go dirty

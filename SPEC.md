@@ -230,10 +230,17 @@ Obsidian web clippings and routes them to `publisher.publish.publish_clipping`.
 2. Slug: Title-Case-hyphen (e.g. `AI-Tools-for-Existential-Security-EA-Forum`)
    via `_consuming_slugify`, collision-resolved against `SITE_CONSUMING_DIR`.
 3. Build a deterministic `/consuming/<Slug>` page: frontmatter
-   (`source: clipping`, `layout`, `backLink/backText`, `created`, `description`),
-   then **your commentary** under `## My commentary` (omitted entirely when
-   there's no comment), a `**Source:**` link + `By <authors> · clipped <date>`
-   byline + a mirror disclaimer, then a **truncated preview** of the clipped
+   (`source: clipping`, `layout`, `backLink/backText`, `created`, `description`;
+   `backLink` is an ABSOLUTE site path derived from the consuming subdir via
+   `_site_url_path`, e.g. `/consuming/`), then **one self-contained raw-HTML
+   "card"** (inline styles only, placed right after the frontmatter, before the
+   body). The card holds: your comment (html-escaped, newlines → `<br>`; the
+   whole `<p>` is omitted when there's no comment), a muted meta line joining
+   the present pieces with ` · ` — a source link (`<a href>domain</a>` with the
+   bare host, `www.` stripped, via `_source_domain`; or the literal
+   `original URL not recorded`), `by <authors>`, `clipped <date>` — and a
+   smaller italic disclaimer whose wording depends on truncation + whether a
+   source URL exists. Below the card comes a **truncated preview** of the clipped
    body. Bodies longer than `CLIPPING_PREVIEW_CHARS` (env
    `NOTES_CLIPPING_PREVIEW_CHARS`, default `1000`) are cut at a clean
    paragraph/sentence/word boundary (never mid-word), rendered as normal
@@ -243,7 +250,9 @@ Obsidian web clippings and routes them to `publisher.publish.publish_clipping`.
    If truncated but no source URL was recorded, the fade `<div>` shows a plain
    "Full text not mirrored" note instead of a link.
 4. Update the consuming `index.md`: insert/replace a
-   `- **[Title](/consuming/Slug)** - description` bullet, grouped `## YYYY` →
+   `- **[Title](/consuming/Slug)** (domain) - description` bullet (the
+   ` (domain)` part — bare host from `_source_domain` — is omitted when there's
+   no source URL), grouped `## YYYY` →
    `### Month` (years + months descending), idempotent on republish, preserving
    the intro paragraph(s) and trailing structure comment.
 5. Stage BOTH the page and the index, commit `consuming: <title>`, push once.

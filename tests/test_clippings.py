@@ -27,8 +27,11 @@ import config  # noqa: E402
 from publisher import publish as publish_mod  # noqa: E402
 from publisher import watcher as watcher_mod  # noqa: E402
 from publisher.publish import (  # noqa: E402
+    _consuming_index_bullet,
     _consuming_slugify,
     _normalize_authors,
+    _site_url_path,
+    _source_domain,
     _strip_wikilink,
     _update_consuming_index,
     publish_clipping,
@@ -263,14 +266,48 @@ class TestHelpers:
     def test_normalize_authors_none(self):
         assert _normalize_authors(None) == ""
 
+    def test_source_domain_strips_www(self):
+        assert _source_domain("https://www.example.com/a/b") == "example.com"
+
+    def test_source_domain_keeps_subdomain(self):
+        assert _source_domain("https://en.wikipedia.org/wiki/X") == "en.wikipedia.org"
+
+    def test_source_domain_strips_port_and_userinfo(self):
+        assert _source_domain("https://user@www.foo.com:8443/x") == "foo.com"
+
+    def test_source_domain_handles_junk(self):
+        assert _source_domain("") == ""
+        assert _source_domain(None) == ""  # type: ignore[arg-type]
+        assert _source_domain("not a url") == ""
+
+    def test_site_url_path_basic(self):
+        assert _site_url_path("src/pages/consuming") == "/consuming/"
+
+    def test_site_url_path_nested(self):
+        assert _site_url_path("repo/site/src/pages/blog/reads") == "/blog/reads/"
+
+    def test_site_url_path_windows_backslashes(self):
+        assert _site_url_path("src\\pages\\consuming") == "/consuming/"
+
+    def test_site_url_path_empty_falls_back_to_root(self):
+        assert _site_url_path("") == "/"
+        assert _site_url_path("src/pages/") == "/"
+
+    def test_site_url_path_no_marker(self):
+        assert _site_url_path("consuming") == "/consuming/"
+
 
 # ---------------------------------------------------------------------------
 # publish_clipping: page rendering
 # ---------------------------------------------------------------------------
 
 
+# Identifying snippet of the subtle card wrapper div.
+_CARD_DIV_SNIPPET = '<div style="border:1px solid var(--color-border)'
+
+
 class TestPublishClippingRendering:
-    def test_with_comment_renders_my_commentary(self, tmp_env):
+    def test_with_comment_renders_card(self, tmp_env):
         src = _make_clipping(
             tmp_env.clippings_dir,
             "clip_with_comment",
@@ -280,13 +317,36 @@ class TestPublishClippingRendering:
         assert result["status"] == "published", result
 
         page = result["site_path"].read_text(encoding="utf-8")
-        assert "## My commentary" in page, page
+        # New card, no old commentary heading / blockquote / header divider.
+        assert "## My commentary" not in page, page
+        assert _CARD_DIV_SNIPPET in page, page
         assert "differential acceleration is exactly right" in page
         assert "source: clipping" in page
         assert "layout: ../../layouts/Layout.astro" in page
         assert "backText: Consuming" in page
+        # No `> ` blockquote disclaimer.
+        assert re.search(r"^> ", page, flags=re.MULTILINE) is None, page
+        # No markdown `---` dividers in the header area (between frontmatter and
+        # the card). The only `---` pair is the frontmatter fence itself.
+        header = page.split(_CARD_DIV_SNIPPET, 1)[0]
+        assert header.count("\n---\n") == 1, header
 
-    def test_without_comment_omits_commentary_section(self, tmp_env):
+    def test_comment_appears_inside_card_escaped(self, tmp_env):
+        src = _make_clipping(
+            tmp_env.clippings_dir,
+            "clip_comment_html",
+            comment="A <b>bold</b> & pointed take.",
+        )
+        result = publish_clipping(src)
+        assert result["status"] == "published", result
+        page = result["site_path"].read_text(encoding="utf-8")
+        # Comment is html-escaped inside the card's first <p>.
+        card = page.split(_CARD_DIV_SNIPPET, 1)[1]
+        assert "A &lt;b&gt;bold&lt;/b&gt; &amp; pointed take." in card, card
+        # No raw HTML tag from the comment leaked into the card body.
+        assert "<b>bold</b>" not in card, card
+
+    def test_without_comment_omits_first_card_p(self, tmp_env):
         src = _make_clipping(
             tmp_env.clippings_dir, "clip_no_comment", comment=None
         )
@@ -295,12 +355,14 @@ class TestPublishClippingRendering:
 
         page = result["site_path"].read_text(encoding="utf-8")
         assert "## My commentary" not in page, page
-        # The body after frontmatter should start with the Source line (no
-        # leading commentary divider).
-        body_after_fm = page.split("---\n", 2)[-1].lstrip("\n")
-        assert body_after_fm.startswith("**Source:**"), body_after_fm[:120]
+        assert _CARD_DIV_SNIPPET in page, page
+        # The card's first child <p> is the meta line (a source link), not a
+        # comment paragraph.
+        card = page.split(_CARD_DIV_SNIPPET, 1)[1]
+        first_p = card.split("<p", 2)[1]
+        assert "<a href=" in first_p, first_p[:200]
 
-    def test_author_wikilink_stripping_in_byline(self, tmp_env):
+    def test_author_wikilink_stripping_in_meta(self, tmp_env):
         src = _make_clipping(
             tmp_env.clippings_dir,
             "clip_authors",
@@ -310,10 +372,10 @@ class TestPublishClippingRendering:
         result = publish_clipping(src)
         assert result["status"] == "published", result
         page = result["site_path"].read_text(encoding="utf-8")
-        assert "By Lizka, Owen Cotton-Barratt" in page, page
+        assert "by Lizka, Owen Cotton-Barratt" in page, page
         assert "[[" not in page, "wikilink brackets leaked into the page"
 
-    def test_source_link_and_disclaimer_present(self, tmp_env):
+    def test_source_link_and_meta_present(self, tmp_env):
         url = "https://forum.effectivealtruism.org/posts/abc/ai-tools"
         src = _make_clipping(
             tmp_env.clippings_dir, "clip_src", source=url, comment="x"
@@ -322,13 +384,23 @@ class TestPublishClippingRendering:
         assert result["status"] == "published", result
         page = result["site_path"].read_text(encoding="utf-8")
 
-        # Pretty source is the host (path is short enough to keep here).
-        assert f"]({url})" in page, page
-        assert "forum.effectivealtruism.org" in page
-        # Disclaimer blockquote now describes a short preview pointing at the
-        # source "above".
-        assert "Mirrored as a short preview" in page
-        assert "the source above" in page
+        # Meta line links the bare domain back to the source URL.
+        assert f'<a href="{url}">forum.effectivealtruism.org</a>' in page, page
+        # Clipped date present in the meta line.
+        assert "clipped 2025-11-27" in page, page
+        # Not-truncated disclaimer wording (short body fixture).
+        assert "formatting may be imperfect" in page, page
+
+    def test_www_stripped_in_meta_domain(self, tmp_env):
+        url = "https://www.example.com/some/article"
+        src = _make_clipping(
+            tmp_env.clippings_dir, "clip_www", source=url, comment="x"
+        )
+        result = publish_clipping(src)
+        assert result["status"] == "published", result
+        page = result["site_path"].read_text(encoding="utf-8")
+        assert f'<a href="{url}">example.com</a>' in page, page
+        assert ">www.example.com<" not in page, page
 
     def test_no_source_url_renders_not_recorded(self, tmp_env):
         src = _make_clipping(
@@ -337,10 +409,9 @@ class TestPublishClippingRendering:
         result = publish_clipping(src)
         assert result["status"] == "published", result
         page = result["site_path"].read_text(encoding="utf-8")
-        assert "**Source:** _(original URL not recorded)_" in page, page
-        # Disclaimer must NOT claim there's an original "above".
-        assert "the source above" not in page, page
-        assert "original source URL was not recorded" in page
+        # No-source meta literal, and no link in the card meta line.
+        assert "original URL not recorded" in page, page
+        assert "<a href=" not in page, page
 
     def test_no_authors_omits_by(self, tmp_env):
         src = _make_clipping(
@@ -349,9 +420,17 @@ class TestPublishClippingRendering:
         result = publish_clipping(src)
         assert result["status"] == "published", result
         page = result["site_path"].read_text(encoding="utf-8")
-        # Byline still has "clipped <date>" but no "By ".
+        # Meta still has "clipped <date>" but no "by ".
         assert "clipped 2025-11-27" in page, page
-        assert re.search(r"^By ", page, flags=re.MULTILINE) is None, page
+        assert "by " not in page, page
+
+    def test_backlink_is_absolute(self, tmp_env):
+        src = _make_clipping(tmp_env.clippings_dir, "clip_back", comment="x")
+        result = publish_clipping(src)
+        assert result["status"] == "published", result
+        page = result["site_path"].read_text(encoding="utf-8")
+        assert "backLink: /consuming/" in page, page
+        assert re.search(r"^backLink: \./\s*$", page, flags=re.MULTILINE) is None, page
 
     def test_body_mirrored_verbatim(self, tmp_env):
         marker = "UNIQUE-MARKER-PHRASE-banana-grommet-42"
@@ -463,9 +542,13 @@ class TestPublishClippingPreview:
         assert result["status"] == "published", result
         page = result["site_path"].read_text(encoding="utf-8")
 
-        # Pull out the preview text (between the last `---` divider and the fade).
-        before_fade = page.split("<div style=", 1)[0]
-        preview = before_fade.rsplit("---\n", 1)[-1].strip()
+        # Pull out the preview text (between the card's closing </div> and the
+        # fade div). The first <div is the card; the body+fade follow it.
+        after_card = page.split("</div>", 1)[1]
+        preview = after_card.split(_FADE_DIV_SNIPPET, 1)[0]
+        # Drop the trailing `<div style="position:relative...` opener fragment
+        # left before the fade snippet match.
+        preview = preview.rsplit("<div style=", 1)[0].strip()
         assert preview, page
         # The preview must end on a complete word that exists in the body.
         words = body.split()
@@ -540,6 +623,8 @@ class TestPublishClippingGit:
         assert "### November" in index
         slug = result["slug"]
         assert f"](/consuming/{slug})" in index
+        # Bullet carries the source domain after the title link.
+        assert f"](/consuming/{slug})** (forum.effectivealtruism.org) - " in index, index
 
     def test_writes_published_at_to_source(self, tmp_env):
         src = _make_clipping(tmp_env.clippings_dir, "clip_wb", comment="x")
@@ -894,3 +979,50 @@ class TestConsumingIndex:
         assert "## 2099" in text
         # Must be the first year section (descending), before 2025.
         assert text.index("## 2099") < text.index("## 2025")
+
+    def test_bullet_with_domain(self):
+        bullet = _consuming_index_bullet(
+            "Stop Making Sense", "Stop-Making-Sense", "great film", "en.wikipedia.org"
+        )
+        assert bullet == (
+            "- **[Stop Making Sense](/consuming/Stop-Making-Sense)** "
+            "(en.wikipedia.org) - great film"
+        )
+
+    def test_bullet_without_domain(self):
+        bullet = _consuming_index_bullet(
+            "Stop Making Sense", "Stop-Making-Sense", "great film"
+        )
+        assert bullet == (
+            "- **[Stop Making Sense](/consuming/Stop-Making-Sense)** - great film"
+        )
+
+    def test_domain_threaded_through_update(self, tmp_path: Path):
+        idx = self._seed(tmp_path)
+        _update_consuming_index(
+            idx,
+            title="Domain Read",
+            slug="Domain-Read",
+            description="desc",
+            entry_date=date(2025, 11, 1),
+            domain="en.wikipedia.org",
+        )
+        text = idx.read_text(encoding="utf-8")
+        assert "](/consuming/Domain-Read)** (en.wikipedia.org) - desc" in text, text
+
+    def test_idempotent_republish_with_domain(self, tmp_path: Path):
+        idx = self._seed(tmp_path)
+        for desc in ("first", "second"):
+            _update_consuming_index(
+                idx,
+                title="Dedup Read",
+                slug="Dedup-Read",
+                description=desc,
+                entry_date=date(2025, 11, 1),
+                domain="example.com",
+            )
+        text = idx.read_text(encoding="utf-8")
+        # De-dupes by /consuming/<slug>; one bullet, latest desc, with domain.
+        assert text.count("](/consuming/Dedup-Read)") == 1, text
+        assert "](/consuming/Dedup-Read)** (example.com) - second" in text, text
+        assert "first" not in text.split("Dedup-Read", 1)[1].split("\n", 1)[0]
