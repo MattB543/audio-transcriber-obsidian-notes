@@ -594,7 +594,20 @@ def run_forever(
     transcript_dir: Path | None = None,
     poll_seconds: int | None = None,
 ) -> None:
-    """Poll forever. Ctrl+C or SIGTERM causes a clean exit after the current tick."""
+    """Poll forever. Ctrl+C or SIGTERM causes a clean exit after the current tick.
+
+    Publishing is opt-in: if NOTES_SITE_ROOT is unset (``config.PUBLISH_ENABLED``
+    is False / ``config.SITE_ROOT`` is None) we log and return immediately rather
+    than spin a loop that would error on a None site path every tick. The tray
+    already gates this, but guard here too so running the module directly
+    (``python -m publisher.watcher``) without a configured site fails cleanly.
+    """
+    if not getattr(config, "PUBLISH_ENABLED", config.SITE_ROOT is not None):
+        logger.info(
+            "Publishing disabled (NOTES_SITE_ROOT not set); watcher not started."
+        )
+        return
+
     poll_seconds = poll_seconds if poll_seconds is not None else config.WATCHER_POLL_SECONDS
     ledger = PublishedLedger()
     blocked_ledger = BlockedLedger(path=_blocked_ledger_path(ledger.path))

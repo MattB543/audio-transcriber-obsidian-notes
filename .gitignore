@@ -16,7 +16,7 @@ venv/
 
 # --- runtime / generated ----------------------------------------------------
 .logs/
-.published.json
+.published*.json
 drafts/
 
 # --- scratch / dev test files (manual sanity checks, not in the pytest suite) -

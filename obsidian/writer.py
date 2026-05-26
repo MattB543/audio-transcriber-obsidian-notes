@@ -50,12 +50,48 @@ logger = logging.getLogger(__name__)
 #: Maximum length of a slug after sanitization.
 SLUG_MAX_LEN: int = 50
 
-#: Folder name inside the vault that holds audio files. Kept as a module
-#: constant so tests / callers can see the exact unicode used.
-AUDIO_VAULT_FOLDER: str = "🎙 Audio"
+#: Fallback folder names used only if the configured paths can't be expressed
+#: relative to the vault (e.g. someone points AUDIO_DIR outside VAULT_ROOT).
+#: These mirror the historical defaults so links degrade to something sane.
+_AUDIO_VAULT_FOLDER_FALLBACK: str = "Audio"
+_TRANSCRIPTIONS_VAULT_SUBFOLDER_FALLBACK: str = "transcriptions"
 
-#: Folder inside ``AUDIO_VAULT_FOLDER`` that holds transcripts.
-TRANSCRIPTIONS_VAULT_SUBFOLDER: str = "transcriptions"
+
+def _audio_vault_folder() -> str:
+    """Vault-relative folder name holding audio files, derived from config.
+
+    Obsidian ``[[wikilinks]]`` are vault-relative, so the folder we link to
+    MUST match where files are actually written (``config.AUDIO_DIR``). We
+    derive it live from config (rather than freezing a literal) so links never
+    drift from the on-disk layout — including when the audio subdir is
+    customised via ``NOTES_AUDIO_SUBDIR`` or tests monkeypatch the paths.
+    """
+    try:
+        return Path(config.AUDIO_DIR).relative_to(config.VAULT_ROOT).as_posix()
+    except ValueError:  # AUDIO_DIR not under VAULT_ROOT — degrade gracefully.
+        return _AUDIO_VAULT_FOLDER_FALLBACK
+
+
+def _transcriptions_vault_subfolder() -> str:
+    """Folder (under the audio dir) holding transcripts, derived from config."""
+    try:
+        return (
+            Path(config.TRANSCRIPT_DIR)
+            .relative_to(config.AUDIO_DIR)
+            .as_posix()
+        )
+    except ValueError:  # TRANSCRIPT_DIR not under AUDIO_DIR — degrade.
+        return _TRANSCRIPTIONS_VAULT_SUBFOLDER_FALLBACK
+
+
+#: Vault-relative folder name that holds audio files. Computed from config at
+#: import for callers/tests that read the constant directly; the frontmatter
+#: builders call :func:`_audio_vault_folder` so a monkeypatched config (tests)
+#: or a custom ``NOTES_AUDIO_SUBDIR`` is always reflected in the links.
+AUDIO_VAULT_FOLDER: str = _audio_vault_folder()
+
+#: Folder inside ``AUDIO_VAULT_FOLDER`` that holds transcripts (from config).
+TRANSCRIPTIONS_VAULT_SUBFOLDER: str = _transcriptions_vault_subfolder()
 
 _SLUG_ALLOWED_RE = re.compile(r"[^a-z0-9-]+")
 _SLUG_MULTIDASH_RE = re.compile(r"-{2,}")
@@ -341,11 +377,13 @@ def _build_cleaned_frontmatter(
     model: str,
 ) -> str:
     """Build the YAML frontmatter string for the cleaned transcript."""
+    audio_folder = _audio_vault_folder()
+    transcripts_folder = _transcriptions_vault_subfolder()
     tags_line = _yaml_list_inline(["voice-memo", *tags])
     aliases_line = _yaml_list_inline([slug])
-    audio_wikilink = f"[[{AUDIO_VAULT_FOLDER}/{timestamp}.flac]]"
+    audio_wikilink = f"[[{audio_folder}/{timestamp}.flac]]"
     raw_wikilink = (
-        f"[[{AUDIO_VAULT_FOLDER}/{TRANSCRIPTIONS_VAULT_SUBFOLDER}/{stem}.raw]]"
+        f"[[{audio_folder}/{transcripts_folder}/{stem}.raw]]"
     )
     lines = [
         "---",
@@ -375,9 +413,11 @@ def _build_raw_frontmatter(
     stem: str,
 ) -> str:
     """Build the YAML frontmatter string for the raw transcript."""
-    audio_wikilink = f"[[{AUDIO_VAULT_FOLDER}/{timestamp}.flac]]"
+    audio_folder = _audio_vault_folder()
+    transcripts_folder = _transcriptions_vault_subfolder()
+    audio_wikilink = f"[[{audio_folder}/{timestamp}.flac]]"
     cleaned_wikilink = (
-        f"[[{AUDIO_VAULT_FOLDER}/{TRANSCRIPTIONS_VAULT_SUBFOLDER}/{stem}]]"
+        f"[[{audio_folder}/{transcripts_folder}/{stem}]]"
     )
     raw_title = f"{title} (raw transcript)"
     lines = [
@@ -436,7 +476,7 @@ def _build_placeholder_frontmatter(
     Marked ``status: transcribing`` and tagged ``processing`` so a future
     "find stuck placeholders" sweep can pick them up trivially.
     """
-    audio_wikilink = f"[[{AUDIO_VAULT_FOLDER}/{timestamp}.flac]]"
+    audio_wikilink = f"[[{_audio_vault_folder()}/{timestamp}.flac]]"
     tags_line = _yaml_list_inline(["voice-memo", "processing"])
     lines = [
         "---",
@@ -464,7 +504,7 @@ def _build_placeholder_doc(
     fm = _build_placeholder_frontmatter(
         date=date, time=time_str, duration=duration, timestamp=timestamp
     )
-    audio_embed = f"![[{AUDIO_VAULT_FOLDER}/{timestamp}.flac]]"
+    audio_embed = f"![[{_audio_vault_folder()}/{timestamp}.flac]]"
     return (
         f"{fm}\n"
         f"{audio_embed}\n"
@@ -490,7 +530,7 @@ def _build_placeholder_error_doc(
     """
     date, time_str = _parse_timestamp(timestamp)
     duration = _format_duration(duration_sec)
-    audio_wikilink = f"[[{AUDIO_VAULT_FOLDER}/{timestamp}.flac]]"
+    audio_wikilink = f"[[{_audio_vault_folder()}/{timestamp}.flac]]"
     tags_line = _yaml_list_inline(["voice-memo", "failed"])
     fm_lines = [
         "---",
@@ -505,7 +545,7 @@ def _build_placeholder_error_doc(
         "---",
     ]
     fm = "\n".join(fm_lines)
-    audio_embed = f"![[{AUDIO_VAULT_FOLDER}/{timestamp}.flac]]"
+    audio_embed = f"![[{_audio_vault_folder()}/{timestamp}.flac]]"
     # Render the exception text inside a fenced code block so backticks /
     # markdown special chars in the message can't break Obsidian rendering.
     exc_text = str(exc) or exc.__class__.__name__
@@ -563,7 +603,7 @@ def _build_transcript_docs(
         tags=tags_list,
         model=model_used,
     )
-    audio_embed = f"![[{AUDIO_VAULT_FOLDER}/{timestamp}.flac]]"
+    audio_embed = f"![[{_audio_vault_folder()}/{timestamp}.flac]]"
     cleaned_doc = (
         f"{cleaned_fm}\n"
         f"{audio_embed}\n"

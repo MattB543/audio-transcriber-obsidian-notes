@@ -477,6 +477,19 @@ def publish_note(
     logger.info("[publish] START %s (existing_slug=%s)",
                 transcript_md_path, existing_slug)
 
+    # Publishing is opt-in. If NOTES_SITE_ROOT was never configured,
+    # config.SITE_ROOT / config.SITE_NOTES_DIR are None and every downstream
+    # path operation would crash on a None. Fail fast with a clear, actionable
+    # error instead of an opaque AttributeError/TypeError mid-flow.
+    if config.SITE_ROOT is None or config.SITE_NOTES_DIR is None:
+        msg = (
+            "Publishing is disabled: NOTES_SITE_ROOT is not set, so there is "
+            "no site repo to publish to. Set NOTES_SITE_ROOT in your .env to "
+            "enable the #publish feature."
+        )
+        logger.error(msg)
+        return _result(status="error", error=msg)
+
     try:
         md = transcript_md_path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:

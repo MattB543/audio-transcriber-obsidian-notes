@@ -24,10 +24,10 @@ from pathlib import Path
 
 import config
 from obsidian.writer import (
-    AUDIO_VAULT_FOLDER,
-    TRANSCRIPTIONS_VAULT_SUBFOLDER,
+    _audio_vault_folder,
     _format_duration,
     _parse_timestamp,
+    _transcriptions_vault_subfolder,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,9 +78,16 @@ def _minimal_daily_frontmatter(date: str) -> str:
 def _build_entry(
     *, time_hhmm: str, timestamp: str, slug: str, title: str, duration: str
 ) -> str:
-    """Render the bullet entry text (no trailing newline)."""
+    """Render the bullet entry text (no trailing newline).
+
+    The link folder names are derived from config (via ``writer``) so the
+    daily-note wikilinks always point at the same vault-relative location the
+    transcript files are actually written to.
+    """
     stem = f"{timestamp}_{slug}" if slug else timestamp
-    link_target = f"{AUDIO_VAULT_FOLDER}/{TRANSCRIPTIONS_VAULT_SUBFOLDER}/{stem}"
+    link_target = (
+        f"{_audio_vault_folder()}/{_transcriptions_vault_subfolder()}/{stem}"
+    )
     return f"- {time_hhmm} [[{link_target}|{title}]] ({duration})"
 
 
@@ -229,7 +236,9 @@ def append_memo_link(
         # present, skip. We compare on the stem (timestamp_slug) so title
         # tweaks don't cause duplicates.
         stem = f"{timestamp}_{slug}" if slug else timestamp
-        idempotency_needle = f"[[{AUDIO_VAULT_FOLDER}/{TRANSCRIPTIONS_VAULT_SUBFOLDER}/{stem}"
+        idempotency_needle = (
+            f"[[{_audio_vault_folder()}/{_transcriptions_vault_subfolder()}/{stem}"
+        )
         if idempotency_needle in content:
             logger.info("Daily note %s already contains entry for %s; skipping", path, stem)
             # Still make sure the file exists on disk (create it if we only

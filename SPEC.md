@@ -14,7 +14,7 @@ This document is the source of truth for component contracts. Individual compone
    - `<slug>.md` — CLEANED (stutters, fillers, false starts removed; punctuation+paragraphs added; **NO content changes, NO rephrasing, NO summarization**)
    - `<slug>.raw.md` — VERBATIM transcript
 6. **Daily Notes**: auto-append a bullet under `## Voice Memos` heading in `Daily Notes/YYYY-MM-DD.md`. Create the daily note if missing.
-7. **Publishing**: trigger on `#publish` tag in Obsidian frontmatter OR body. Watcher polls every 60s for newly-tagged notes. Cleaned transcript → LLM cleanup pass in the author's voice → draft in `drafts/<slug>.md` → copy to `<site>/src/pages/notes/<slug>.md` → git commit + push → static host auto-deploys.
+7. **Publishing** (opt-in; disabled unless `NOTES_SITE_ROOT` is set — when unset, the tray does not start the publisher watcher): trigger on `#publish` tag in Obsidian frontmatter OR body. Watcher polls every 60s for newly-tagged notes. Cleaned transcript → **deterministic** reformat into the site's note format (no LLM call at publish time) → draft in `drafts/<slug>.md` → copy to `<site>/src/pages/notes/<slug>.md` → git commit + push → static host auto-deploys. The only LLM use in the pipeline is the Gemini transcript cleanup at recording time.
 8. **Startup**: tray app auto-starts on Windows login via Task Scheduler
 9. **Migration**: rename-only migration of pre-existing legacy transcripts (add YAML frontmatter, rename to ISO format, preserve raw text)
 10. **Location**: all code lives at the repo root (`NP_ROOT`)
@@ -68,7 +68,7 @@ notes-pipeline/
 ├── publisher/
 │   ├── __init__.py
 │   ├── watcher.py             # polls TRANSCRIPT_DIR for #publish tag
-│   └── publish.py             # LLM publish-cleanup → drafts/ → site → git push
+│   └── publish.py             # deterministic reformat → drafts/ → site → git push
 ├── drafts/                    # staged drafts before publish
 ├── scripts/
 │   ├── install.ps1            # pip install + Task Scheduler register
@@ -114,7 +114,7 @@ Sidecar JSON schema:
   "channels": 1,
   "codec": "flac",
   "device": "Microphone (Realtek Audio)",
-  "hostname": "MATT-DESKTOP",
+  "hostname": "<your-hostname>",
   "hotkey": "win+alt+space",
   "pipeline_version": "1.0"
 }
@@ -128,7 +128,6 @@ class TranscriptResult(TypedDict):
     cleaned: str          # stutters removed, punctuation added, NO content changes
     slug: str             # LLM-generated kebab-case, 3-5 words, for filename
     title: str            # human-readable title, Title Case, <60 chars
-    summary: str          # 1-2 sentence summary for YAML
     tags: list[str]       # 2-4 content tags (lowercase, kebab-case, no `#`)
     duration_sec: float   # from audio probe
     model_used: str       # e.g. "gemini-3-flash-preview"
@@ -150,14 +149,10 @@ audio: "[[🎙 Audio/2026-04-24_143208.flac]]"
 raw_transcript: "[[🎙 Audio/transcriptions/2026-04-24_143208_<slug>.raw]]"
 source: voice-memo
 tags: [voice-memo, <tag1>, <tag2>]
-summary: "<summary>"
 status: captured
 model: <model_used>
 ---
 ![[🎙 Audio/2026-04-24_143208.flac]]
-
-## Summary
-<summary>
 
 ## Transcript
 <cleaned transcript>
@@ -197,8 +192,12 @@ Polls `TRANSCRIPT_DIR/*.md` every 60s. For any file where:
 
 ### Publish pipeline
 
+Publishing is opt-in: the watcher only runs when `NOTES_SITE_ROOT` is set. The
+pipeline is **deterministic** — it does NOT call any LLM. (The Gemini LLM is
+used only for transcript cleanup at transcription time.)
+
 1. Read cleaned transcript markdown
-2. Call Gemini with the "publish-cleanup" prompt (see `publisher/publish.py` — prompt refines cleaned transcript into a publishable Astro note in the author's voice; see prompt template in SPEC appendix)
+2. Deterministically reformat the cleaned transcript into the site's note format (strip/rewrite frontmatter into Astro frontmatter, drop the audio embed, etc.) — no Gemini/LLM call
 3. Write result to `drafts/<slug>.md` with Astro frontmatter
 4. Check the site repo's git working tree is clean
 5. Copy draft to `<site>/src/pages/notes/<slug>.md`
@@ -235,9 +234,9 @@ The output should be the same words the speaker intended, just without disfluenc
 Return ONLY the cleaned transcript text. No headers, no commentary.
 ```
 
-## Publish prompt (for `publisher/publish.py`)
+## Publishing (for `publisher/publish.py`)
 
-See the full prompt in `publisher/publish.py`. It's based on the research-agent recommendation and uses `how-this-website-works.md` as the style reference.
+The publish step is **deterministic** — it does not call any LLM. It reformats the already-cleaned transcript markdown into the site's note format (Astro frontmatter), writes a draft, copies it into the site repo, and commits/pushes. There is no publish-time prompt or style-reference note.
 
 ## Environment variables
 

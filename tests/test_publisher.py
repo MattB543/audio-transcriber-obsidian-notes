@@ -197,12 +197,14 @@ def tmp_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     ledger_path = tmp_path / ".published.json"
 
     notes_dir = site / "src" / "pages" / "notes"
-    ref_note = notes_dir / "how-this-website-works.md"
 
-    # Patch config module attrs.
+    # Patch config module attrs. Publishing is opt-in via NOTES_SITE_ROOT, so
+    # the tests stand in a real (tmp) site repo: SITE_ROOT / SITE_NOTES_DIR are
+    # set and PUBLISH_ENABLED is flipped True. (SITE_REFERENCE_NOTE was removed
+    # along with the old LLM publish-cleanup pass, so it's no longer patched.)
     monkeypatch.setattr(config, "SITE_ROOT", site)
     monkeypatch.setattr(config, "SITE_NOTES_DIR", notes_dir)
-    monkeypatch.setattr(config, "SITE_REFERENCE_NOTE", ref_note)
+    monkeypatch.setattr(config, "PUBLISH_ENABLED", True)
     monkeypatch.setattr(config, "TRANSCRIPT_DIR", transcript_dir)
     monkeypatch.setattr(config, "DRAFTS_DIR", drafts_dir)
     monkeypatch.setattr(config, "PUBLISHED_LEDGER", ledger_path)
@@ -215,7 +217,6 @@ def tmp_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         drafts_dir=drafts_dir,
         ledger_path=ledger_path,
         notes_dir=notes_dir,
-        ref_note=ref_note,
     )
 
 
@@ -1240,6 +1241,41 @@ class TestPublishNote:
 
         # The publish commit DID succeed before the rollback was attempted.
         assert result["commit_sha"]
+
+
+# ---------------------------------------------------------------------------
+# Publishing disabled (opt-in gating) — H5
+# ---------------------------------------------------------------------------
+
+
+class TestPublishingDisabled:
+    def test_publish_note_errors_cleanly_when_site_root_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """If NOTES_SITE_ROOT was never set, SITE_ROOT/SITE_NOTES_DIR are None.
+        publish_note must return a clean error (not crash on a None path)."""
+        transcript_dir = tmp_path / "transcripts"
+        transcript_dir.mkdir()
+        monkeypatch.setattr(config, "SITE_ROOT", None)
+        monkeypatch.setattr(config, "SITE_NOTES_DIR", None)
+        monkeypatch.setattr(config, "PUBLISH_ENABLED", False)
+        monkeypatch.setattr(config, "TRANSCRIPT_DIR", transcript_dir)
+
+        src = _make_transcript(transcript_dir, "memo", frontmatter_publish=True)
+        result = publish_note(src)
+
+        assert result["status"] == "error", result
+        assert result["error"] and "NOTES_SITE_ROOT" in result["error"], result["error"]
+
+    def test_run_forever_returns_immediately_when_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """run_forever must no-op (not loop) when publishing is disabled."""
+        monkeypatch.setattr(config, "SITE_ROOT", None)
+        monkeypatch.setattr(config, "PUBLISH_ENABLED", False)
+        # If this tried to actually poll it would block; returning proves the
+        # early guard fired.
+        watcher_mod.run_forever(transcript_dir=tmp_path)
 
 
 # ---------------------------------------------------------------------------

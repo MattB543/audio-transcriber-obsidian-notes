@@ -5,8 +5,8 @@ publish, all wired through a Windows tray app and a global hotkey.
 
 Press `Win+Alt+Space`, talk, press `Win+Alt+Space` again. A cleaned transcript
 and a verbatim copy land in your Obsidian vault, a bullet is appended to today's
-Daily Note, and any note you tag with `#publish` gets cleaned again, copied
-into your website repo, and pushed to git.
+Daily Note, and (if you've opted in) any note you tag with `#publish` gets
+deterministically reformatted into your site's note format and pushed to git.
 
 > **Platform:** Windows (uses a system-tray app + Task Scheduler). The
 > transcription core is cross-platform, but the tray/auto-start glue is
@@ -25,8 +25,11 @@ into your website repo, and pushed to git.
    - `<slug>.md` — cleaned (fillers/stutters out, punctuation in, no rephrasing).
    - `<slug>.raw.md` — verbatim transcript with every "um".
 6. Daily-note bullet auto-appended under `## Voice Memos`.
-7. Tagging a note with `#publish` triggers a 60-second poll → LLM cleanup pass
-   in your voice → draft → static-site copy → git commit + push.
+7. **Publishing is opt-in** (set `NOTES_SITE_ROOT` to enable). When enabled,
+   tagging a note with `#publish` triggers a 60-second poll → deterministic
+   reformat into the site's note format → draft → static-site copy → git
+   commit + push. No LLM is called at publish time — the only LLM use is the
+   Gemini transcript cleanup at recording time.
 8. Tray app auto-starts on Windows login via Task Scheduler.
 
 ---
@@ -60,7 +63,7 @@ Start-ScheduledTask -TaskName "notes-pipeline-tray"
 ```
 
 Look for the gray circle in the system tray. Press `Win+Alt+Space` — it turns
-red and beeps. Press again — it turns gray, beeps, and starts transcribing.
+red (recording). Press again — it turns gray and starts transcribing.
 
 If PowerShell's execution policy blocks the installer:
 
@@ -97,38 +100,31 @@ set env vars instead.
 
 ## How to use
 
-1. Press `Win+Alt+Space` anywhere — the tray icon turns red and beeps.
+1. Press `Win+Alt+Space` anywhere — the tray icon turns red (recording).
 2. Talk.
-3. Press `Win+Alt+Space` again — the icon goes back to gray, you hear a lower
-   beep, and the file gets shipped to Gemini in the background.
+3. Press `Win+Alt+Space` again — the icon goes back to gray and the file gets
+   shipped to Gemini in the background.
 4. A few seconds later your vault gains:
    - `<timestamp>_<slug>.md` — cleaned transcript.
    - `<timestamp>_<slug>.raw.md` — verbatim sibling.
    - A new bullet under `## Voice Memos` in today's Daily Note.
 
-To **publish** a note to your site, set `NOTES_SITE_ROOT` and add `#publish` to
-the note's frontmatter `tags:` list or anywhere in the body. Within 60 s the
-watcher picks it up, runs the publish-cleanup LLM pass, drops a draft in
+Publishing is **opt-in** and disabled by default. To enable it, set
+`NOTES_SITE_ROOT` in `.env`; when it's unset, the tray never starts the
+publisher watcher. Once enabled, add `#publish` to a note's frontmatter `tags:`
+list or anywhere in the body. Within 60 s the watcher picks it up, runs a
+**deterministic** reformat into the site's note format (no LLM call — no extra
+API cost or privacy exposure at publish time), drops a draft in
 `drafts/<slug>.md`, copies to `<site>/src/pages/notes/<slug>.md`, and pushes to
 `origin/main`. (Publishing relies on your existing git credentials for that
 repo — nothing is stored here.)
 
-### Try it without a microphone
-
-A short sample clip ships in `example-audio/test.flac`. Transcribe it directly:
-
-```powershell
-python -m transcribe.transcribe .\example-audio\test.flac
-```
-
 ### Retry a failed transcription
 
 If a recording's transcription failed (expired key, network blip, etc.), the
-audio FLAC is still in your audio folder. Re-run by hand with:
-
-```powershell
-python -m transcribe.transcribe "<path-to>.flac"
-```
+audio FLAC still lives in your vault's audio folder — nothing is lost. Fix the
+underlying cause (e.g. refresh `GEMINI_API_KEY`), then re-trigger via the tray
+menu, or simply re-record the note.
 
 ### Migrate legacy transcripts
 
@@ -230,8 +226,8 @@ paths are unaffected by the move.
                            |
                            v   (#publish tag detected)
                  +---------+----------+
-                 | publisher.watcher  |  (60s poll)
-                 | publisher.publish  |  (LLM voice cleanup)
+                 | publisher.watcher  |  (60s poll, opt-in)
+                 | publisher.publish  |  (deterministic reformat, no LLM)
                  +---------+----------+
                            |
                            v
@@ -259,7 +255,7 @@ audio-transcriber-obsidian-notes/
 ├── transcribe/             (Gemini wrapper: raw + cleaned)
 ├── obsidian/               (markdown writer, daily-note appender, legacy migrator)
 ├── publisher/              (watcher + publish pipeline)
-├── example-audio/          (a short sample clip for a no-mic test)
+├── example-audio/          (a short sample clip; see example-audio/README.md)
 ├── scripts/
 │   ├── install.ps1         (pip install + register Task Scheduler task)
 │   ├── uninstall.ps1       (remove task)

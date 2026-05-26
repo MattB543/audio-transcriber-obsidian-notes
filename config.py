@@ -46,16 +46,23 @@ TRANSCRIPT_DIR: Path = AUDIO_DIR / os.environ.get(
 )
 DAILY_DIR: Path = VAULT_ROOT / os.environ.get("NOTES_DAILY_SUBDIR", "Daily Notes")
 
-# --- personal-site publishing (optional) ------------------------------------
+# --- personal-site publishing (OPT-IN, disabled by default) -----------------
 # The "#publish" feature copies a cleaned note into a static-site repo and
-# pushes it. Leave NOTES_SITE_ROOT unset if you don't want this — the watcher
-# simply won't have anywhere to publish to.
-SITE_ROOT: Path = _env_path("NOTES_SITE_ROOT", NP_ROOT / "_publish_target")
-SITE_NOTES_DIR: Path = SITE_ROOT / os.environ.get(
-    "NOTES_SITE_NOTES_SUBDIR", "src/pages/notes"
+# pushes it. It is DISABLED unless NOTES_SITE_ROOT is set to a real git repo:
+# when unset/empty, SITE_ROOT is None, PUBLISH_ENABLED is False, and the tray
+# never starts the publisher watcher. (The publish step is deterministic — no
+# LLM is involved; Gemini is used only for transcript cleanup.)
+_site_root_raw = os.environ.get("NOTES_SITE_ROOT")
+SITE_ROOT: Path | None = (
+    Path(os.path.expandvars(_site_root_raw.strip())).expanduser()
+    if _site_root_raw and _site_root_raw.strip()
+    else None
 )
-SITE_REFERENCE_NOTE: Path = SITE_NOTES_DIR / os.environ.get(
-    "NOTES_SITE_REFERENCE_NOTE", "how-this-website-works.md"
+PUBLISH_ENABLED: bool = SITE_ROOT is not None
+SITE_NOTES_DIR: Path | None = (
+    SITE_ROOT / os.environ.get("NOTES_SITE_NOTES_SUBDIR", "src/pages/notes")
+    if SITE_ROOT is not None
+    else None
 )
 
 # --- repo-local paths -------------------------------------------------------

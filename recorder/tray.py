@@ -27,6 +27,7 @@ from pynput import keyboard
 # pystray needs to be imported via its backend; on Windows this is win32.
 import pystray
 
+import config
 from config import (
     AUDIO_CODEC,
     AUDIO_DIR,
@@ -677,7 +678,20 @@ class TrayApp:
     # ------------------------------------------------------------- publisher
 
     def _start_publisher_watcher(self) -> None:
-        """Spawn the optional publisher watcher thread, if the module exists."""
+        """Spawn the optional publisher watcher thread, if publishing is enabled.
+
+        Publishing is opt-in: it only runs when ``NOTES_SITE_ROOT`` is set (so
+        ``config.PUBLISH_ENABLED`` is True). When it's not set, we log an INFO
+        line and return early without starting the thread — otherwise a
+        ``#publish``-tagged note would make the watcher error on a ``None``
+        site path every poll cycle.
+        """
+        if not config.PUBLISH_ENABLED:
+            logger.info(
+                "Publishing disabled (NOTES_SITE_ROOT not set); watcher not started."
+            )
+            return
+
         def _runner() -> None:
             try:
                 from publisher.watcher import run_forever  # type: ignore

@@ -1,4 +1,4 @@
-"""One-shot migration of Matt's existing 18 legacy voice-memo transcripts.
+"""One-shot migration of your existing pre-pipeline voice-memo transcripts.
 
 Legacy filenames look like ``<M>-<D>-<YY>_<HH>.<MM>.md`` (e.g.
 ``7-8-25_22.33.md``). Their bodies start with a block of inline hashtags

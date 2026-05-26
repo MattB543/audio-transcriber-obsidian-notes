@@ -312,6 +312,92 @@ class TestWriteTranscript:
         assert leftover_tmps == [], f"unexpected tmp leftovers: {leftover_tmps}"
 
 
+# --- wikilink folder is config-derived (B2 regression) -----------------------
+
+
+class TestWikilinkFolderFollowsConfig:
+    """The ``[[...]]`` wikilink folder MUST be derived from config so links
+    point at the same vault-relative location files are actually written to.
+
+    Previously the folder was the frozen literal ``🎙 Audio`` while the default
+    config wrote files under ``Audio`` — every non-author user got broken
+    links. These tests pin the derivation: change the configured audio /
+    transcript subdirs and the links must follow.
+    """
+
+    @pytest.fixture
+    def plain_vault(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> dict[str, Path]:
+        """A vault using the *default* (non-emoji) ``Audio`` subdir layout."""
+        vault_root = tmp_path / "vault"
+        audio_dir = vault_root / "Audio"
+        transcript_dir = audio_dir / "transcriptions"
+        daily_dir = vault_root / "Daily Notes"
+        for d in (audio_dir, transcript_dir, daily_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(config, "VAULT_ROOT", vault_root)
+        monkeypatch.setattr(config, "AUDIO_DIR", audio_dir)
+        monkeypatch.setattr(config, "TRANSCRIPT_DIR", transcript_dir)
+        monkeypatch.setattr(config, "DAILY_DIR", daily_dir)
+        return {"transcripts": transcript_dir, "daily": daily_dir}
+
+    def test_helpers_derive_from_config(self, plain_vault: dict) -> None:
+        assert writer._audio_vault_folder() == "Audio"
+        assert writer._transcriptions_vault_subfolder() == "transcriptions"
+
+    def test_cleaned_links_use_config_folder_not_hardcoded_emoji(
+        self, plain_vault: dict
+    ) -> None:
+        cleaned, _ = writer.write_transcript(_tr(), _rec())
+        text = cleaned.read_text(encoding="utf-8")
+        assert 'audio: "[[Audio/2026-04-24_143208.flac]]"' in text
+        assert (
+            'raw_transcript: "[[Audio/transcriptions/'
+            '2026-04-24_143208_ship-the-thing.raw]]"' in text
+        )
+        assert "![[Audio/2026-04-24_143208.flac]]" in text
+        # The old hardcoded emoji folder must NOT appear.
+        assert "🎙 Audio" not in text
+
+    def test_daily_note_link_uses_config_folder(self, plain_vault: dict) -> None:
+        path = daily_note.append_memo_link(
+            "2026-04-24_143208", "ship-the-thing", "Ship The Thing", 187.4
+        )
+        text = path.read_text(encoding="utf-8")
+        assert (
+            "[[Audio/transcriptions/2026-04-24_143208_ship-the-thing|"
+            "Ship The Thing]]" in text
+        )
+        assert "🎙 Audio" not in text
+
+    def test_custom_audio_subdir_is_reflected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A custom NOTES_AUDIO_SUBDIR (e.g. an emoji folder) flows into links."""
+        vault_root = tmp_path / "vault"
+        audio_dir = vault_root / "🎙 Memos"
+        transcript_dir = audio_dir / "txt"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(config, "VAULT_ROOT", vault_root)
+        monkeypatch.setattr(config, "AUDIO_DIR", audio_dir)
+        monkeypatch.setattr(config, "TRANSCRIPT_DIR", transcript_dir)
+
+        cleaned, _ = writer.write_transcript(_tr(), _rec())
+        text = cleaned.read_text(encoding="utf-8")
+        assert 'audio: "[[🎙 Memos/2026-04-24_143208.flac]]"' in text
+        assert "🎙 Memos/txt/2026-04-24_143208_ship-the-thing.raw" in text
+
+    def test_falls_back_when_audio_dir_outside_vault(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If AUDIO_DIR isn't under VAULT_ROOT we degrade to the fallback name
+        rather than crashing on relative_to()."""
+        monkeypatch.setattr(config, "VAULT_ROOT", tmp_path / "vault")
+        monkeypatch.setattr(config, "AUDIO_DIR", tmp_path / "elsewhere" / "Audio")
+        assert writer._audio_vault_folder() == writer._AUDIO_VAULT_FOLDER_FALLBACK
+
+
 # --- write_placeholder + finalize_transcript ---------------------------------
 
 
